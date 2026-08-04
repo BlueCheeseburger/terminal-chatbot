@@ -1,0 +1,4 @@
+.gemini-legacy-tui/
+__pycache__/
+*.py[cod]
+.DS_Store
