@@ -357,12 +357,13 @@ class Tui:
         self.add(screen, height - 3, 0, "-" * max(width - 1, 0))
         self.add(screen, height - 2, 0, self.status[: max(width - 1, 0)], curses.A_DIM)
         self.add(screen, height - 1, 0, "You > ")
+        screen.refresh()
 
     def read_line(self, screen: "curses._CursesWindow", label: str) -> Optional[str]:
-        height, width = screen.getmaxyx()
         buffer: List[str] = []
         cursor = 0
         while True:
+            height, width = screen.getmaxyx()
             prompt_row = height - 2 if height >= 10 and width >= 42 else height - 1
             prompt_label = "> " if prompt_row != height - 1 else label
             available_width = max(width - len(prompt_label) - 2, 1)
@@ -374,6 +375,9 @@ class Tui:
             screen.move(prompt_row, min((1 if prompt_row != height - 1 else 0) + len(prompt_label) + cursor - start, width - 1))
             screen.refresh()
             key = screen.get_wch()
+            if key == curses.KEY_RESIZE:
+                self.draw_chat(screen)
+                continue
             if key in ("\n", "\r"):
                 return "".join(buffer).strip()
             if key == "\x03":
