@@ -70,6 +70,8 @@ The availability check is deliberately advisory: it uses the current `models.lis
 
 Gemini entries stream by default through `v1beta/models/{model}:streamGenerateContent`; toggle Streaming off in Settings to use the non-streaming `generateContent` endpoint instead. `chat-bison-001` uses the old PaLM `v1beta3/models/chat-bison-001:generateMessage` request shape. Keeping those code paths separate is important: PaLM Chat was a conversational API and does not accept the modern Gemini `contents` schema.
 
+Settings also accepts a custom Gemini model ID. Custom IDs use the modern Gemini API and appear on replies exactly as entered. Terminal controls font size rather than the TUI: in macOS Terminal, use `Command-Plus` to enlarge and `Command-Minus` to reduce the font size.
+
 The transcript is shared when you switch Gemini models, so the selected model sees the prior conversation. Each assistant reply is tagged with the model that generated it. Use `Ctrl+N`, `/new`, or `/clear` to start without that context.
 
 For macOS Terminal Command-key equivalents, see [MACOS_TERMINAL_SHORTCUTS.md](MACOS_TERMINAL_SHORTCUTS.md).

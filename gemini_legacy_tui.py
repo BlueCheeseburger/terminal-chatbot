@@ -247,7 +247,7 @@ class Tui:
         self.api_key = api_key.strip()
         self.store = store
         self.data = store.load()
-        if self.data.get("model") not in MODEL_BY_ID:
+        if not isinstance(self.data.get("model"), str) or not self.data["model"].strip():
             self.data["model"] = DEFAULT_MODEL_ID
         if not isinstance(self.data.get("settings"), dict):
             self.data["settings"] = {}
@@ -260,7 +260,11 @@ class Tui:
 
     @property
     def model(self) -> ModelSpec:
-        return MODEL_BY_ID[self.data["model"]]
+        identifier = self.data["model"]
+        return MODEL_BY_ID.get(
+            identifier,
+            ModelSpec(identifier, identifier, "Custom Gemini Model", "gemini", "Custom model ID"),
+        )
 
     @property
     def streaming_enabled(self) -> bool:
@@ -577,6 +581,7 @@ class Tui:
         selected = 0
         settings = (
             ("Streaming", "Render Gemini output as it arrives", "stream"),
+            ("Custom model ID", "Use a Gemini model ID not in the catalog", "custom_model"),
             ("System instruction", "Set or clear the instruction for this chat", "system"),
             ("API key", "Enter an API key for this run only", "key"),
             ("Model availability", "Check models visible to this API key", "check"),
@@ -591,7 +596,7 @@ class Tui:
             height, width = screen.getmaxyx()
             self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("base"))
             self.add(screen, 0, 2, "SETTINGS", self.style("header", curses.A_BOLD))
-            self.add(screen, 2, 2, "Use arrows and Enter. Space toggles streaming.", self.style("muted"))
+            self.add(screen, 2, 2, "Terminal font: Command+Plus / Command+Minus", self.style("muted"))
             self.add(screen, 3, 0, "-" * max(width - 1, 0), self.style("border"))
             for index, (label, description, _) in enumerate(settings):
                 row = 5 + index * 3
@@ -603,6 +608,8 @@ class Tui:
                 self.add(screen, row, 2, "{}  {: <22} {}".format(marker, label, value)[: width - 4], style)
                 if row + 1 < height - 1:
                     self.add(screen, row + 1, 5, description[: width - 7], self.style("muted"))
+                if label == "Custom model ID" and self.data["model"] not in MODEL_BY_ID and row + 2 < height - 1:
+                    self.add(screen, row + 2, 5, self.data["model"][: width - 7], self.style("accent"))
                 if label == "System instruction" and self.data.get("system_instruction") and row + 2 < height - 1:
                     self.add(screen, row + 2, 5, "Configured", self.style("accent"))
             self.add(screen, height - 1, 2, "Up/Down select   Enter open   Space toggle   Esc close", self.style("footer"))
@@ -625,6 +632,12 @@ class Tui:
                 self.data["settings"]["streaming"] = not self.streaming_enabled
                 self.store.save(self.data)
                 self.status = "Streaming {}.".format("enabled" if self.streaming_enabled else "disabled")
+            elif action == "custom_model":
+                value = self.prompt_dialog(screen, "Custom Gemini model ID", self.data["model"])
+                if value:
+                    self.data["model"] = value
+                    self.store.save(self.data)
+                    self.status = "Selected custom model {}. Shared context is retained.".format(value)
             elif action == "system":
                 self.edit_system_instruction(screen)
             elif action == "key":

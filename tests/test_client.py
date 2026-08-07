@@ -119,6 +119,14 @@ class ClientTests(unittest.TestCase):
             tui = Tui("", SessionStore(Path(directory)))
         self.assertTrue(tui.streaming_enabled)
 
+    def test_custom_model_id_uses_gemini_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.save({"model": "gemini-my-custom-id", "system_instruction": "", "history": []})
+            tui = Tui("", store)
+        self.assertEqual(tui.model.identifier, "gemini-my-custom-id")
+        self.assertEqual(tui.model.protocol, "gemini")
+
 
 if __name__ == "__main__":
     unittest.main()
