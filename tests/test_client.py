@@ -114,6 +114,11 @@ class ClientTests(unittest.TestCase):
     def test_large_stream_chunk_is_split_for_progressive_display(self):
         self.assertEqual(Tui.display_fragments("abcdefghijklmnopq", width=8), ["abcdefgh", "ijklmnop", "q"])
 
+    def test_streaming_setting_defaults_to_enabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+        self.assertTrue(tui.streaming_enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

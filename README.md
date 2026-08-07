@@ -26,13 +26,11 @@ The app saves its transcript, chosen model, and system instruction in `./.gemini
 | Control | Action |
 | --- | --- |
 | `F1` or `/help` | Help |
-| `Tab` or `Ctrl+K` | Action menu |
+| `Tab` | Main menu |
 | `/` | Searchable slash-command menu |
-| `F2`, `Ctrl+L`, or `/model` | Searchable model picker |
-| `F3` or `/system` | Set system instruction |
-| `F4` or `/key` | Enter API key for this run |
-| `F5` or `/check` | Ask Google which configured models the key can list |
-| `Ctrl+N`, `/new`, or `/clear` | Clear the shared conversation context |
+| `/model` | Searchable model picker |
+| `/settings` | Streaming toggle, system instruction, API key, and availability check |
+| `/clear` | Clear the shared conversation context |
 | `/restart` or `/reopen` | Close and reopen the TUI without rerunning the shell command |
 | `/models` | Show the built-in catalog |
 | `/quit` | Exit |
@@ -70,7 +68,7 @@ The availability check is deliberately advisory: it uses the current `models.lis
 
 ## API behavior
 
-Gemini entries use `v1beta/models/{model}:streamGenerateContent` and render text as Server-Sent Event chunks arrive. `chat-bison-001` uses the old PaLM `v1beta3/models/chat-bison-001:generateMessage` request shape. Keeping those code paths separate is important: PaLM Chat was a conversational API and does not accept the modern Gemini `contents` schema.
+Gemini entries stream by default through `v1beta/models/{model}:streamGenerateContent`; toggle Streaming off in Settings to use the non-streaming `generateContent` endpoint instead. `chat-bison-001` uses the old PaLM `v1beta3/models/chat-bison-001:generateMessage` request shape. Keeping those code paths separate is important: PaLM Chat was a conversational API and does not accept the modern Gemini `contents` schema.
 
 The transcript is shared when you switch Gemini models, so the selected model sees the prior conversation. Each assistant reply is tagged with the model that generated it. Use `Ctrl+N`, `/new`, or `/clear` to start without that context.
 

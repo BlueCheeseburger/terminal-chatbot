@@ -49,10 +49,7 @@ DEFAULT_MODEL_ID = "gemini-2.5-flash"
 SLASH_COMMANDS: Sequence[Tuple[str, str]] = (
     ("/clear", "Clear the shared conversation context"),
     ("/model", "Choose a model"),
-    ("/models", "View the configured model catalog"),
-    ("/system", "Set the system instruction"),
-    ("/key", "Enter an API key for this run"),
-    ("/check", "Check models available to this key"),
+    ("/settings", "Open settings"),
     ("/restart", "Close and reopen the TUI"),
     ("/help", "Show help and shortcuts"),
     ("/quit", "Exit Gemini Legacy"),
@@ -252,6 +249,9 @@ class Tui:
         self.data = store.load()
         if self.data.get("model") not in MODEL_BY_ID:
             self.data["model"] = DEFAULT_MODEL_ID
+        if not isinstance(self.data.get("settings"), dict):
+            self.data["settings"] = {}
+        self.data["settings"].setdefault("streaming", True)
         self.status = "Ready"
         self.available_models: Optional[set] = None
         self.running = True
@@ -261,6 +261,10 @@ class Tui:
     @property
     def model(self) -> ModelSpec:
         return MODEL_BY_ID[self.data["model"]]
+
+    @property
+    def streaming_enabled(self) -> bool:
+        return bool(self.data["settings"].get("streaming", True))
 
     def run(self, screen: "curses._CursesWindow") -> None:
         self.initialize_theme(screen)
@@ -320,7 +324,7 @@ class Tui:
         if not lines:
             empty_row = max(5, (height - 8) // 2)
             self.add(screen, empty_row, 4, "Start a conversation", self.style("text", curses.A_BOLD))
-            self.add(screen, empty_row + 2, 4, "Tab opens actions. Ctrl+L chooses a model.", self.style("muted"))
+            self.add(screen, empty_row + 2, 4, "Tab opens the menu. / opens commands.", self.style("muted"))
         visible = lines[-history_height:]
         for row, (line, style) in enumerate(visible, start=3):
             self.add(screen, row, 0, line[: max(width - 1, 0)], style)
@@ -329,7 +333,7 @@ class Tui:
             self.add(screen, index, 1, line, self.status_style())
         self.add(screen, height - 3, 0, "-" * max(width - 1, 0), self.style("border"))
         self.add(screen, height - 2, 1, ">", self.style("accent", curses.A_BOLD))
-        self.add(screen, height - 1, 1, "Tab Actions   Ctrl+L Models   Ctrl+N Clear   F3 System   F4 Key   F5 Check", self.style("footer"))
+        self.add(screen, height - 1, 1, "Tab Menu   / Commands", self.style("footer"))
         screen.refresh()
 
     def draw_compact_chat(self, screen: "curses._CursesWindow") -> None:
@@ -429,9 +433,9 @@ class Tui:
         selected_model = self.model
         self.data["history"].append({"role": "user", "content": text})
         self.store.save(self.data)
-        self.status = "Streaming {}...".format(selected_model.label)
+        self.status = "Streaming {}...".format(selected_model.identifier) if self.streaming_enabled else "Waiting for {}...".format(selected_model.identifier)
         try:
-            if selected_model.protocol == "gemini":
+            if selected_model.protocol == "gemini" and self.streaming_enabled:
                 reply = {"role": "model", "content": "", "model_id": selected_model.identifier}
                 self.data["history"].append(reply)
                 self.draw_chat(screen)
@@ -494,6 +498,8 @@ class Tui:
             self.select_model(screen)
         elif command == "/models":
             self.show_models(screen)
+        elif command == "/settings":
+            self.open_settings(screen)
         elif command == "/system":
             self.data["system_instruction"] = argument.strip()
             self.store.save(self.data)
@@ -509,11 +515,9 @@ class Tui:
 
     def open_action_menu(self, screen: "curses._CursesWindow") -> None:
         actions = (
-            ("Clear context", "Remove the shared conversation history", "clear"),
             ("Choose model", "Browse and filter the model catalog", "model"),
-            ("System instruction", "Set a persistent instruction for this chat", "system"),
-            ("API key", "Enter a key for this run only", "key"),
-            ("Check availability", "List models visible to this API key", "check"),
+            ("Settings", "Streaming, system instruction, API key, and availability", "settings"),
+            ("Clear context", "Remove the shared conversation history", "clear"),
             ("Restart interface", "Close and reopen the terminal interface", "restart"),
             ("Help", "Show shortcuts and slash commands", "help"),
             ("Exit", "Close Gemini Legacy", "exit"),
@@ -557,12 +561,8 @@ class Tui:
                 self.clear_context()
             elif action == "model":
                 self.select_model(screen)
-            elif action == "system":
-                self.edit_system_instruction(screen)
-            elif action == "key":
-                self.configure_api_key(screen)
-            elif action == "check":
-                self.check_availability(screen)
+            elif action == "settings":
+                self.open_settings(screen)
             elif action == "restart":
                 self.restart_requested = True
                 self.running = False
@@ -571,6 +571,68 @@ class Tui:
             elif action == "exit":
                 self.running = False
             break
+        self.show_cursor()
+
+    def open_settings(self, screen: "curses._CursesWindow") -> None:
+        selected = 0
+        settings = (
+            ("Streaming", "Render Gemini output as it arrives", "stream"),
+            ("System instruction", "Set or clear the instruction for this chat", "system"),
+            ("API key", "Enter an API key for this run only", "key"),
+            ("Model availability", "Check models visible to this API key", "check"),
+            ("Back", "Return to chat", "back"),
+        )
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        while True:
+            screen.erase()
+            height, width = screen.getmaxyx()
+            self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("base"))
+            self.add(screen, 0, 2, "SETTINGS", self.style("header", curses.A_BOLD))
+            self.add(screen, 2, 2, "Use arrows and Enter. Space toggles streaming.", self.style("muted"))
+            self.add(screen, 3, 0, "-" * max(width - 1, 0), self.style("border"))
+            for index, (label, description, _) in enumerate(settings):
+                row = 5 + index * 3
+                if row >= height - 2:
+                    break
+                marker = ">" if index == selected else " "
+                style = self.style("selected") if index == selected else self.style("text")
+                value = "[ON]" if label == "Streaming" and self.streaming_enabled else "[OFF]" if label == "Streaming" else ""
+                self.add(screen, row, 2, "{}  {: <22} {}".format(marker, label, value)[: width - 4], style)
+                if row + 1 < height - 1:
+                    self.add(screen, row + 1, 5, description[: width - 7], self.style("muted"))
+                if label == "System instruction" and self.data.get("system_instruction") and row + 2 < height - 1:
+                    self.add(screen, row + 2, 5, "Configured", self.style("accent"))
+            self.add(screen, height - 1, 2, "Up/Down select   Enter open   Space toggle   Esc close", self.style("footer"))
+            screen.refresh()
+            key = screen.get_wch()
+            if key in ("\x1b", "q", "Q"):
+                break
+            if key in (curses.KEY_UP, "k"):
+                selected = max(0, selected - 1)
+                continue
+            if key in (curses.KEY_DOWN, "j"):
+                selected = min(len(settings) - 1, selected + 1)
+                continue
+            action = settings[selected][2]
+            if key == " " and action != "stream":
+                continue
+            if key not in (" ", "\n", "\r"):
+                continue
+            if action == "stream":
+                self.data["settings"]["streaming"] = not self.streaming_enabled
+                self.store.save(self.data)
+                self.status = "Streaming {}.".format("enabled" if self.streaming_enabled else "disabled")
+            elif action == "system":
+                self.edit_system_instruction(screen)
+            elif action == "key":
+                self.configure_api_key(screen)
+            elif action == "check":
+                self.check_availability(screen)
+            elif action == "back":
+                break
         self.show_cursor()
 
     def open_command_palette(self, screen: "curses._CursesWindow") -> Optional[str]:
@@ -764,9 +826,9 @@ class Tui:
             screen,
             "Help",
             [
-                "Type / for the command palette | Tab or Ctrl+K actions | Ctrl+L model picker | Ctrl+N clear context",
-                "/new and /clear erase the shared context; /model opens the picker; /models shows the catalog.",
-                "/system <text> sets the system instruction; /key enters an API key; /check checks models; /restart reopens the UI.",
+                "Tab opens the main menu. Type / for the searchable command palette.",
+                "Settings contains streaming, system instruction, API key, and model availability.",
+                "/clear erases shared context; /model opens the picker; /settings opens settings; /restart reopens the UI.",
                 "/quit exits. API keys are never written to disk. Transcripts live in the selected state folder.",
             ],
         )
