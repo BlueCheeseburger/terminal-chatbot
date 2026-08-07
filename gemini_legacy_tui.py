@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""A dependency-free terminal chat client for Gemini Flash and legacy PaLM Chat."""
+"""A lightweight terminal chat client for Gemini Flash and legacy PaLM Chat."""
 
 import argparse
-import curses
 import json
 import os
 import sys
@@ -13,6 +12,15 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+try:
+    import curses
+except ImportError as error:
+    if os.name == "nt":
+        raise SystemExit(
+            "Windows terminal support is not installed. Run: py -m pip install -r requirements.txt"
+        ) from error
+    raise
 
 
 APP_NAME = "Gemini Legacy TUI"
@@ -600,7 +608,13 @@ class Tui:
             height, width = screen.getmaxyx()
             self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("base"))
             self.add(screen, 0, 2, "SETTINGS", self.style("header", curses.A_BOLD))
-            self.add(screen, 2, 2, "Terminal font: Command+Plus / Command-Minus (Terminal resizes window)", self.style("muted"))
+            if os.name == "nt":
+                font_hint = "Terminal font: Ctrl+Plus / Ctrl+Minus (terminal-managed)"
+            elif sys.platform == "darwin":
+                font_hint = "Terminal font: Command+Plus / Command-Minus (Terminal resizes window)"
+            else:
+                font_hint = "Terminal font size is managed by your terminal application"
+            self.add(screen, 2, 2, font_hint, self.style("muted"))
             self.add(screen, 3, 0, "-" * max(width - 1, 0), self.style("border"))
             for index, (label, description, _) in enumerate(settings):
                 row = 5 + index * 3
