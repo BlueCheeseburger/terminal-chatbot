@@ -600,7 +600,7 @@ class Tui:
             height, width = screen.getmaxyx()
             self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("base"))
             self.add(screen, 0, 2, "SETTINGS", self.style("header", curses.A_BOLD))
-            self.add(screen, 2, 2, "Terminal font: Command+Plus / Command+Minus", self.style("muted"))
+            self.add(screen, 2, 2, "Terminal font: Command+Plus / Command-Minus (Terminal resizes window)", self.style("muted"))
             self.add(screen, 3, 0, "-" * max(width - 1, 0), self.style("border"))
             for index, (label, description, _) in enumerate(settings):
                 row = 5 + index * 3
