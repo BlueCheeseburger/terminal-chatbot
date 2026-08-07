@@ -307,9 +307,14 @@ class Tui:
             is_user = item["role"] == "user"
             label = "YOU" if is_user else item.get("model_id", "UNKNOWN MODEL").upper()
             role_style = self.style("user" if is_user else "assistant", curses.A_BOLD)
-            wrapped = textwrap.wrap(item["content"], width=max(width - 7, 20), replace_whitespace=False) or [""]
-            lines.append(("  {}  {}".format(label, wrapped[0]), role_style))
-            lines.extend(("       " + line, self.style("text")) for line in wrapped[1:])
+            if is_user:
+                wrapped = textwrap.wrap(item["content"], width=max(width - 8, 20), replace_whitespace=False) or [""]
+                lines.append(("  YOU  " + wrapped[0], role_style))
+                lines.extend(("       " + line, self.style("text")) for line in wrapped[1:])
+            else:
+                lines.append(("  " + label, role_style))
+                wrapped = textwrap.wrap(item["content"], width=max(width - 8, 20), replace_whitespace=False) or [""]
+                lines.extend(("       " + line, self.style("text")) for line in wrapped)
             lines.append(("", 0))
 
         if not lines:
@@ -432,8 +437,16 @@ class Tui:
                 self.draw_chat(screen)
 
                 def append_chunk(chunk: str) -> None:
-                    reply["content"] += chunk
-                    self.draw_chat(screen)
+                    fragments = self.display_fragments(chunk)
+                    for fragment in fragments:
+                        reply["content"] += fragment
+                        self.status = "Streaming {}... {} chars".format(selected_model.identifier, len(reply["content"]))
+                        self.draw_chat(screen)
+                        if len(fragments) > 1:
+                            try:
+                                curses.napms(8)
+                            except curses.error:
+                                pass
 
                 answer = GoogleApiClient(self.api_key).generate_stream(
                     selected_model, self.data["history"][:-1], self.data.get("system_instruction", ""), append_chunk
@@ -510,6 +523,55 @@ class Tui:
             curses.curs_set(0)
         except curses.error:
             pass
+        while True:
+            screen.erase()
+            height, width = screen.getmaxyx()
+            self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("base"))
+            self.add(screen, 0, 2, "ACTIONS", self.style("header", curses.A_BOLD))
+            self.add(screen, 2, 2, "Use arrows and Enter. Esc returns to chat.", self.style("muted"))
+            self.add(screen, 3, 0, "-" * max(width - 1, 0), self.style("border"))
+            for index, (label, description, _) in enumerate(actions):
+                row = 5 + index * 2
+                if row >= height - 2:
+                    break
+                marker = ">" if index == selected else " "
+                style = self.style("selected") if index == selected else self.style("text")
+                self.add(screen, row, 2, "{}  {: <23}".format(marker, label)[: width - 4], style)
+                if row + 1 < height - 1:
+                    self.add(screen, row + 1, 5, description[: width - 7], self.style("muted"))
+            self.add(screen, height - 1, 2, "Up/Down select   Enter open   Esc close", self.style("footer"))
+            screen.refresh()
+            key = screen.get_wch()
+            if key in ("\x1b", "\t", "q", "Q"):
+                break
+            if key in (curses.KEY_UP, "k"):
+                selected = max(0, selected - 1)
+                continue
+            if key in (curses.KEY_DOWN, "j"):
+                selected = min(len(actions) - 1, selected + 1)
+                continue
+            if key not in ("\n", "\r"):
+                continue
+            action = actions[selected][2]
+            if action == "clear":
+                self.clear_context()
+            elif action == "model":
+                self.select_model(screen)
+            elif action == "system":
+                self.edit_system_instruction(screen)
+            elif action == "key":
+                self.configure_api_key(screen)
+            elif action == "check":
+                self.check_availability(screen)
+            elif action == "restart":
+                self.restart_requested = True
+                self.running = False
+            elif action == "help":
+                self.show_help(screen)
+            elif action == "exit":
+                self.running = False
+            break
+        self.show_cursor()
 
     def open_command_palette(self, screen: "curses._CursesWindow") -> Optional[str]:
         query = ""
@@ -564,58 +626,6 @@ class Tui:
                 query = ""
             elif isinstance(key, str) and key.isprintable():
                 query += key
-        while True:
-            screen.erase()
-            height, width = screen.getmaxyx()
-            self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("base"))
-            self.add(screen, 0, 2, "ACTIONS", self.style("header", curses.A_BOLD))
-            self.add(screen, 2, 2, "Use arrows and Enter. Esc returns to chat.", self.style("muted"))
-            self.add(screen, 3, 0, "-" * max(width - 1, 0), self.style("border"))
-            for index, (label, description, _) in enumerate(actions):
-                row = 5 + index * 2
-                if row >= height - 2:
-                    break
-                marker = ">" if index == selected else " "
-                style = self.style("selected") if index == selected else self.style("text")
-                self.add(screen, row, 2, "{}  {: <23}".format(marker, label)[: width - 4], style)
-                if row + 1 < height - 1:
-                    self.add(screen, row + 1, 5, description[: width - 7], self.style("muted"))
-            self.add(screen, height - 1, 2, "Up/Down select   Enter open   Esc close", self.style("footer"))
-            screen.refresh()
-            key = screen.get_wch()
-            if key in ("\x1b", "\t", "q", "Q"):
-                break
-            if key in (curses.KEY_UP, "k"):
-                selected = max(0, selected - 1)
-                continue
-            if key in (curses.KEY_DOWN, "j"):
-                selected = min(len(actions) - 1, selected + 1)
-                continue
-            if key not in ("\n", "\r"):
-                continue
-            action = actions[selected][2]
-            if action == "clear":
-                self.clear_context()
-            elif action == "model":
-                self.select_model(screen)
-            elif action == "system":
-                self.edit_system_instruction(screen)
-            elif action == "key":
-                self.configure_api_key(screen)
-            elif action == "check":
-                self.check_availability(screen)
-            elif action == "restart":
-                self.restart_requested = True
-                self.running = False
-            elif action == "help":
-                self.show_help(screen)
-            elif action == "exit":
-                self.running = False
-            break
-        try:
-            curses.curs_set(1)
-        except curses.error:
-            pass
 
     def select_model(self, screen: "curses._CursesWindow") -> None:
         selected_id = self.model.identifier
@@ -789,6 +799,11 @@ class Tui:
             screen.addstr(row, column, value, style)
         except curses.error:
             pass
+
+    @staticmethod
+    def display_fragments(chunk: str, width: int = 16) -> List[str]:
+        """Keep SSE responses visibly progressive when a provider sends a large chunk."""
+        return [chunk[index : index + width] for index in range(0, len(chunk), width)] or [""]
 
     @staticmethod
     def show_cursor() -> None:

@@ -111,6 +111,9 @@ class ClientTests(unittest.TestCase):
         self.assertIn("gemini-1.5-flash is unavailable", message)
         self.assertIn("Ctrl+L", message)
 
+    def test_large_stream_chunk_is_split_for_progressive_display(self):
+        self.assertEqual(Tui.display_fragments("abcdefghijklmnopq", width=8), ["abcdefgh", "ijklmnop", "q"])
+
 
 if __name__ == "__main__":
     unittest.main()
