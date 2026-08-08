@@ -218,6 +218,9 @@ class ClientTests(unittest.TestCase):
     def test_large_stream_chunk_is_split_for_progressive_display(self):
         self.assertEqual(Tui.display_fragments("abcdefghijklmnopq", width=8), ["abcdefgh", "ijklmnop", "q"])
 
+    def test_normal_stream_chunks_render_character_by_character(self):
+        self.assertEqual(Tui.display_fragments("stream"), ["s", "t", "r", "e", "a", "m"])
+
     def test_stream_chunk_repaint_count_is_bounded(self):
         fragments = Tui.display_fragments("x" * 10000)
         self.assertLessEqual(len(fragments), MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK)

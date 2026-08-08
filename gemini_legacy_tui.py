@@ -38,7 +38,9 @@ MAX_DIALOG_CHARS = 64 * 1024
 MAX_INPUT_CHARS = 64 * 1024
 MAX_MODEL_ID_CHARS = 256
 MAX_SESSION_BYTES = 8 * 1024 * 1024
-MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK = 32
+MAX_CHARACTER_STREAM_CHUNK_CHARS = 512
+MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK = 64
+STREAM_RENDER_DELAY_MS = 12
 MAX_STREAM_EVENT_BYTES = 1024 * 1024
 MAX_STREAM_TEXT_CHARS = 2 * 1024 * 1024
 
@@ -765,7 +767,7 @@ class Tui:
                         self.draw_chat(screen)
                         if len(fragments) > 1:
                             try:
-                                curses.napms(8)
+                                curses.napms(STREAM_RENDER_DELAY_MS)
                             except curses.error:
                                 pass
 
@@ -1305,14 +1307,17 @@ class Tui:
         return "".join(cleaned)
 
     @staticmethod
-    def display_fragments(chunk: str, width: int = 16) -> List[str]:
-        """Keep SSE responses visibly progressive when a provider sends a large chunk."""
+    def display_fragments(chunk: str, width: int = 1) -> List[str]:
+        """Animate ordinary stream chunks while bounding work for oversized ones."""
         minimum_width = max(width, 1)
-        fragment_width = max(
-            minimum_width,
-            (len(chunk) + MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK - 1)
-            // MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK,
-        )
+        if minimum_width == 1 and len(chunk) <= MAX_CHARACTER_STREAM_CHUNK_CHARS:
+            fragment_width = 1
+        else:
+            fragment_width = max(
+                minimum_width,
+                (len(chunk) + MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK - 1)
+                // MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK,
+            )
         return [chunk[index : index + fragment_width] for index in range(0, len(chunk), fragment_width)] or [""]
 
     @staticmethod
