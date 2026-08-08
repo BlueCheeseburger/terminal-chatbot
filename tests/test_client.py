@@ -10,6 +10,7 @@ from unittest.mock import patch
 import gemini_legacy_tui as app
 from gemini_legacy_tui import (
     ApiError,
+    DEFAULT_SYSTEM_INSTRUCTION,
     GoogleApiClient,
     MAX_API_RESPONSE_BYTES,
     MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK,
@@ -254,8 +255,9 @@ class ClientTests(unittest.TestCase):
             }
         )
         self.assertEqual(normalized["model"], "gemini-2.5-flash")
-        self.assertEqual(normalized["system_instruction"], "")
+        self.assertEqual(normalized["system_instruction"], DEFAULT_SYSTEM_INSTRUCTION)
         self.assertTrue(normalized["settings"]["streaming"])
+        self.assertFalse(normalized["settings"]["system_instruction_configured"])
         self.assertEqual(
             normalized["history"],
             [
@@ -263,6 +265,13 @@ class ClientTests(unittest.TestCase):
                 {"role": "model", "content": "hi", "model_id": "gemini-test"},
             ],
         )
+
+    def test_explicitly_cleared_system_instruction_stays_cleared(self):
+        normalized = SessionStore.normalize(
+            {"system_instruction": "", "settings": {"system_instruction_configured": True}}
+        )
+        self.assertEqual(normalized["system_instruction"], "")
+        self.assertTrue(normalized["settings"]["system_instruction_configured"])
 
     @unittest.skipIf(os.name == "nt", "Windows chmod has different permission semantics")
     def test_session_store_uses_private_file_permissions(self):
@@ -321,6 +330,18 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(offset, 3)
         self.assertEqual(maximum, 6)
 
+    def test_transcript_reader_preserves_full_message_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+            tui.data["history"] = [
+                {"role": "user", "content": "first line\nsecond line"},
+                {"role": "model", "content": "reply", "model_id": "gemini-2.5-flash"},
+            ]
+        self.assertEqual(
+            tui.transcript_lines(),
+            ["YOU", "first line", "second line", "", "GEMINI-2.5-FLASH", "reply", ""],
+        )
+
     def test_wrap_content_preserves_explicit_blank_lines(self):
         self.assertEqual(Tui.wrap_content("first\n\nsecond", 20), ["first", "", "second"])
 
@@ -343,7 +364,7 @@ class ClientTests(unittest.TestCase):
     def test_command_palette_lists_every_supported_user_command(self):
         commands = {command for command, _ in SLASH_COMMANDS}
         self.assertTrue(
-            {"/clear", "/new", "/model", "/models", "/settings", "/retry", "/system", "/key", "/check", "/restart", "/help", "/quit"}.issubset(commands)
+            {"/clear", "/new", "/model", "/models", "/settings", "/transcript", "/retry", "/system", "/key", "/check", "/restart", "/help", "/quit"}.issubset(commands)
         )
 
     @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open", side_effect=TimeoutError())

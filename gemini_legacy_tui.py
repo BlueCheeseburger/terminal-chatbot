@@ -71,12 +71,19 @@ MODEL_CATALOG: Sequence[ModelSpec] = (
 
 MODEL_BY_ID = {model.identifier: model for model in MODEL_CATALOG}
 DEFAULT_MODEL_ID = "gemini-2.5-flash"
+DEFAULT_SYSTEM_INSTRUCTION = (
+    "You are replying inside a terminal chat interface. Use plain text only and do not use "
+    "Markdown emphasis or other visual styling, including bold, italics, headings, block quotes, "
+    "tables, or decorative separators. Blank lines between distinct blocks are allowed when they "
+    "make the response easier to read."
+)
 SLASH_COMMANDS: Sequence[Tuple[str, str]] = (
     ("/clear", "Clear the shared conversation context"),
     ("/new", "Start a new conversation context"),
     ("/model", "Choose a model"),
     ("/models", "Show the configured model catalog"),
     ("/settings", "Open settings"),
+    ("/transcript", "Read the complete transcript"),
     ("/retry", "Retry the last failed prompt"),
     ("/system", "Set the system instruction"),
     ("/key", "Enter an API key for this run"),
@@ -410,9 +417,12 @@ class SessionStore:
             model = validate_model_id(model) if isinstance(model, str) else DEFAULT_MODEL_ID
         except ApiError:
             model = DEFAULT_MODEL_ID
-        system_instruction = data.get("system_instruction", "")
-        if not isinstance(system_instruction, str):
-            system_instruction = ""
+        raw_system_instruction = data.get("system_instruction")
+        system_instruction = (
+            raw_system_instruction
+            if isinstance(raw_system_instruction, str)
+            else DEFAULT_SYSTEM_INSTRUCTION
+        )
         history = []
         raw_history = data.get("history", [])
         if isinstance(raw_history, list):
@@ -430,11 +440,24 @@ class SessionStore:
                 history.append(normalized)
         settings = data.get("settings", {})
         streaming = settings.get("streaming", True) if isinstance(settings, dict) else True
+        default_instruction_configured = isinstance(raw_system_instruction, str) and bool(raw_system_instruction)
+        system_instruction_configured = (
+            settings.get("system_instruction_configured", default_instruction_configured)
+            if isinstance(settings, dict)
+            else default_instruction_configured
+        )
+        if not isinstance(system_instruction_configured, bool):
+            system_instruction_configured = bool(system_instruction)
+        if not system_instruction_configured:
+            system_instruction = DEFAULT_SYSTEM_INSTRUCTION
         return {
             "model": model,
             "system_instruction": system_instruction,
             "history": history,
-            "settings": {"streaming": streaming if isinstance(streaming, bool) else True},
+            "settings": {
+                "streaming": streaming if isinstance(streaming, bool) else True,
+                "system_instruction_configured": system_instruction_configured,
+            },
         }
 
     def save(self, data: dict) -> None:
@@ -484,6 +507,7 @@ class Tui:
         if not isinstance(self.data.get("settings"), dict):
             self.data["settings"] = {}
         self.data["settings"].setdefault("streaming", True)
+        self.data["settings"].setdefault("system_instruction_configured", False)
         self.status = "Ready"
         self.available_models: Optional[set] = None
         self.running = True
@@ -548,6 +572,18 @@ class Tui:
             lines.append(("", 0))
         return lines
 
+    def transcript_lines(self) -> List[str]:
+        lines: List[str] = []
+        for item in self.data["history"]:
+            if item["role"] == "user":
+                label = "YOU"
+            else:
+                label = item.get("model_id", "UNKNOWN MODEL").upper()
+            lines.append(label)
+            lines.extend(item["content"].splitlines() or [""])
+            lines.append("")
+        return lines or ["No messages in this session."]
+
     def remember_prompt(self, text: str) -> None:
         if text and (not self.prompt_history or self.prompt_history[-1] != text):
             self.prompt_history.append(text)
@@ -610,9 +646,9 @@ class Tui:
         self.add(screen, height - 3, 0, "-" * max(width - 1, 0), self.style("border"))
         self.add(screen, height - 2, 1, ">", self.style("accent", curses.A_BOLD))
         if self.scroll_offset:
-            footer = "PgUp/PgDn Scroll   {} lines above latest".format(self.scroll_offset)
+            footer = "PgUp/Ctrl+U Scroll   {} lines above latest".format(self.scroll_offset)
         else:
-            footer = "Tab Menu   / Commands   PgUp Scroll   Up Recall"
+            footer = "Tab Menu   / Commands   PgUp/Ctrl+U Scroll   Up Recall"
         self.add(screen, height - 1, 1, footer[: width - 2], self.style("footer"))
         screen.refresh()
 
@@ -660,11 +696,11 @@ class Tui:
             if key == curses.KEY_RESIZE:
                 self.draw_chat(screen)
                 continue
-            if key == curses.KEY_PPAGE:
+            if key in (curses.KEY_PPAGE, "\x15"):
                 self.scroll_offset += max(height - 10, 1)
                 self.draw_chat(screen)
                 continue
-            if key == curses.KEY_NPAGE:
+            if key in (curses.KEY_NPAGE, "\x04"):
                 self.scroll_offset = max(0, self.scroll_offset - max(height - 10, 1))
                 self.draw_chat(screen)
                 continue
@@ -834,9 +870,12 @@ class Tui:
             self.retry_last(screen)
         elif command == "/settings":
             self.open_settings(screen)
+        elif command in ("/transcript", "/history"):
+            self.show_transcript(screen)
         elif command == "/system":
             if argument.strip():
                 self.data["system_instruction"] = argument.strip()[:MAX_DIALOG_CHARS]
+                self.data["settings"]["system_instruction_configured"] = True
                 self.store.save(self.data)
                 self.status = "System instruction updated."
             else:
@@ -854,6 +893,7 @@ class Tui:
         actions = (
             ("Choose model", "Browse and filter the model catalog", "model"),
             ("Settings", "Streaming, system instruction, API key, and availability", "settings"),
+            ("View transcript", "Read the complete rewrapped conversation", "transcript"),
             ("Clear context", "Remove the shared conversation history", "clear"),
             ("Retry failed prompt", "Run the most recent failed prompt again", "retry"),
             ("Restart interface", "Close and reopen the terminal interface", "restart"),
@@ -901,6 +941,8 @@ class Tui:
                 self.select_model(screen)
             elif action == "settings":
                 self.open_settings(screen)
+            elif action == "transcript":
+                self.show_transcript(screen)
             elif action == "retry":
                 self.retry_last(screen)
             elif action == "restart":
@@ -952,8 +994,13 @@ class Tui:
                     self.add(screen, row + 1, 5, description[: width - 7], self.style("muted"))
                 if label == "Custom model ID" and self.data["model"] not in MODEL_BY_ID and row + 2 < height - 1:
                     self.add(screen, row + 2, 5, self.data["model"][: width - 7], self.style("accent"))
-                if label == "System instruction" and self.data.get("system_instruction") and row + 2 < height - 1:
-                    self.add(screen, row + 2, 5, "Configured", self.style("accent"))
+                if label == "System instruction" and row + 2 < height - 1:
+                    instruction_state = (
+                        "Custom"
+                        if self.data["settings"].get("system_instruction_configured")
+                        else "Terminal default"
+                    )
+                    self.add(screen, row + 2, 5, instruction_state, self.style("accent"))
             self.add(screen, height - 1, 2, "Up/Down select   Enter open   Space toggle   Esc close", self.style("footer"))
             screen.refresh()
             key = screen.get_wch()
@@ -1151,6 +1198,7 @@ class Tui:
         )
         if value is not None:
             self.data["system_instruction"] = value
+            self.data["settings"]["system_instruction_configured"] = True
             self.store.save(self.data)
             self.status = "System instruction {}.".format("updated" if value else "cleared")
 
@@ -1231,7 +1279,8 @@ class Tui:
             "Help",
             [
                 "Tab opens the main menu. Type / for the searchable command palette.",
-                "Page Up and Page Down scroll the transcript. Up and Down recall submitted prompts.",
+                "Page Up/Page Down or Ctrl+U/Ctrl+D scroll the chat. Up and Down recall submitted prompts.",
+                "/transcript opens the complete conversation reader with Up/Down scrolling.",
                 "Settings contains streaming, custom model ID, system instruction, API key, and model availability.",
                 "/clear erases context; /retry repeats a failed prompt; /restart reopens the UI.",
                 "API keys are never written to disk. Transcripts live in the selected state folder.",
@@ -1241,6 +1290,9 @@ class Tui:
     def show_models(self, screen: "curses._CursesWindow") -> None:
         lines = ["{} [{}] - {}".format(model.identifier, model.group, self.availability_marker(model)) for model in MODEL_CATALOG]
         self.show_message(screen, "Configured model catalog", lines)
+
+    def show_transcript(self, screen: "curses._CursesWindow") -> None:
+        self.show_message(screen, "Complete transcript", self.transcript_lines())
 
     def show_message(self, screen: "curses._CursesWindow", title: str, lines: Sequence[str]) -> None:
         offset = 0
@@ -1263,7 +1315,7 @@ class Tui:
                 position = "{}-{}/{}".format(first, last, len(wrapped_lines))
             else:
                 position = "0/0"
-            footer = "Up/Down/PgUp/PgDn scroll   Enter/Esc close   {}".format(position)
+            footer = "Up/Down/PgUp/PgDn/Ctrl+U/Ctrl+D scroll   Enter/Esc close   {}".format(position)
             self.add(screen, height - 1, 1, footer[: width - 2], self.style("footer"))
             screen.refresh()
             key = screen.get_wch()
@@ -1275,9 +1327,9 @@ class Tui:
                 offset -= 1
             elif key == curses.KEY_DOWN:
                 offset += 1
-            elif key == curses.KEY_PPAGE:
+            elif key in (curses.KEY_PPAGE, "\x15"):
                 offset -= page_height
-            elif key == curses.KEY_NPAGE:
+            elif key in (curses.KEY_NPAGE, "\x04"):
                 offset += page_height
             elif key == curses.KEY_HOME:
                 offset = 0
