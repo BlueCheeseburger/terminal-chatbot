@@ -56,8 +56,14 @@ MODEL_BY_ID = {model.identifier: model for model in MODEL_CATALOG}
 DEFAULT_MODEL_ID = "gemini-2.5-flash"
 SLASH_COMMANDS: Sequence[Tuple[str, str]] = (
     ("/clear", "Clear the shared conversation context"),
+    ("/new", "Start a new conversation context"),
     ("/model", "Choose a model"),
+    ("/models", "Show the configured model catalog"),
     ("/settings", "Open settings"),
+    ("/retry", "Retry the last failed prompt"),
+    ("/system", "Set the system instruction"),
+    ("/key", "Enter an API key for this run"),
+    ("/check", "Check model availability"),
     ("/restart", "Close and reopen the TUI"),
     ("/help", "Show help and shortcuts"),
     ("/quit", "Exit Gemini Legacy"),
@@ -95,6 +101,8 @@ class GoogleApiClient:
             raise ApiError("HTTP {}: {}".format(error.code, message)) from error
         except urllib.error.URLError as error:
             raise ApiError("Network error: {}".format(error.reason)) from error
+        except TimeoutError as error:
+            raise ApiError("Request timed out. Check the network connection and try again.") from error
         except json.JSONDecodeError as error:
             raise ApiError("Google returned an invalid JSON response.") from error
 
@@ -193,6 +201,8 @@ class GoogleApiClient:
             raise ApiError("HTTP {}: {}".format(error.code, message)) from error
         except urllib.error.URLError as error:
             raise ApiError("Network error: {}".format(error.reason)) from error
+        except TimeoutError as error:
+            raise ApiError("Request timed out. Check the network connection and try again.") from error
         text = "".join(received).strip()
         if not text:
             raise ApiError("The selected model returned no text.")
@@ -233,11 +243,43 @@ class SessionStore:
         try:
             with self.path.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
-            if not isinstance(data.get("history", []), list):
-                raise ValueError("history is not a list")
-            return data
+            return self.normalize(data)
         except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
-            return {"model": DEFAULT_MODEL_ID, "system_instruction": "", "history": []}
+            return self.normalize({})
+
+    @staticmethod
+    def normalize(data: object) -> dict:
+        if not isinstance(data, dict):
+            data = {}
+        model = data.get("model", DEFAULT_MODEL_ID)
+        if not isinstance(model, str) or not model.strip():
+            model = DEFAULT_MODEL_ID
+        system_instruction = data.get("system_instruction", "")
+        if not isinstance(system_instruction, str):
+            system_instruction = ""
+        history = []
+        raw_history = data.get("history", [])
+        if isinstance(raw_history, list):
+            for item in raw_history:
+                if not isinstance(item, dict):
+                    continue
+                role = item.get("role")
+                content = item.get("content")
+                if role not in ("user", "model") or not isinstance(content, str) or not content:
+                    continue
+                normalized = {"role": role, "content": content}
+                model_id = item.get("model_id")
+                if role == "model" and isinstance(model_id, str) and model_id:
+                    normalized["model_id"] = model_id
+                history.append(normalized)
+        settings = data.get("settings", {})
+        streaming = settings.get("streaming", True) if isinstance(settings, dict) else True
+        return {
+            "model": model.strip(),
+            "system_instruction": system_instruction,
+            "history": history,
+            "settings": {"streaming": streaming if isinstance(streaming, bool) else True},
+        }
 
     def save(self, data: dict) -> None:
         try:
@@ -245,7 +287,9 @@ class SessionStore:
             temporary = self.path.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as handle:
                 json.dump(data, handle, indent=2, ensure_ascii=True)
+            os.chmod(temporary, 0o600)
             temporary.replace(self.path)
+            os.chmod(self.path, 0o600)
         except OSError:
             pass  # A read-only directory should not stop a chat session.
 
@@ -265,6 +309,11 @@ class Tui:
         self.running = True
         self.restart_requested = False
         self.colors: Dict[str, int] = {}
+        self.scroll_offset = 0
+        self.prompt_history = [
+            item["content"] for item in self.data["history"] if item["role"] == "user"
+        ]
+        self.last_failed_prompt: Optional[str] = None
 
     @property
     def model(self) -> ModelSpec:
@@ -277,6 +326,51 @@ class Tui:
     @property
     def streaming_enabled(self) -> bool:
         return bool(self.data["settings"].get("streaming", True))
+
+    @staticmethod
+    def wrap_content(content: str, width: int) -> List[str]:
+        wrapped: List[str] = []
+        for source_line in content.splitlines() or [""]:
+            wrapped.extend(
+                textwrap.wrap(source_line, width=max(width, 1), replace_whitespace=False) or [""]
+            )
+        return wrapped
+
+    @staticmethod
+    def history_window(
+        lines: Sequence[Tuple[str, int]], height: int, offset: int
+    ) -> Tuple[List[Tuple[str, int]], int, int]:
+        window_height = max(height, 1)
+        maximum_offset = max(len(lines) - window_height, 0)
+        normalized_offset = min(max(offset, 0), maximum_offset)
+        end = len(lines) - normalized_offset
+        start = max(end - window_height, 0)
+        return list(lines[start:end]), normalized_offset, maximum_offset
+
+    def render_history(self, width: int, compact: bool = False) -> List[Tuple[str, int]]:
+        lines: List[Tuple[str, int]] = []
+        content_width = max(width - (5 if compact else 8), 8)
+        for item in self.data["history"]:
+            is_user = item["role"] == "user"
+            label = "YOU" if is_user else item.get("model_id", "UNKNOWN MODEL").upper()
+            role_style = self.style("user" if is_user else "assistant", curses.A_BOLD)
+            wrapped = self.wrap_content(item["content"], content_width)
+            if compact:
+                compact_label = "You" if is_user else item.get("model_id", "Unknown model")
+                lines.append((compact_label + ": " + wrapped[0], role_style))
+                lines.extend(("   " + line, self.style("text")) for line in wrapped[1:])
+            elif is_user:
+                lines.append(("  YOU  " + wrapped[0], role_style))
+                lines.extend(("       " + line, self.style("text")) for line in wrapped[1:])
+            else:
+                lines.append(("  " + label, role_style))
+                lines.extend(("       " + line, self.style("text")) for line in wrapped)
+            lines.append(("", 0))
+        return lines
+
+    def remember_prompt(self, text: str) -> None:
+        if text and (not self.prompt_history or self.prompt_history[-1] != text):
+            self.prompt_history.append(text)
 
     def run(self, screen: "curses._CursesWindow") -> None:
         self.initialize_theme(screen)
@@ -318,26 +412,13 @@ class Tui:
         self.add(screen, 2, 0, "-" * max(width - 1, 0), self.style("border"))
 
         history_height = max(height - 9, 1)
-        lines: List[Tuple[str, int]] = []
-        for item in self.data["history"]:
-            is_user = item["role"] == "user"
-            label = "YOU" if is_user else item.get("model_id", "UNKNOWN MODEL").upper()
-            role_style = self.style("user" if is_user else "assistant", curses.A_BOLD)
-            if is_user:
-                wrapped = textwrap.wrap(item["content"], width=max(width - 8, 20), replace_whitespace=False) or [""]
-                lines.append(("  YOU  " + wrapped[0], role_style))
-                lines.extend(("       " + line, self.style("text")) for line in wrapped[1:])
-            else:
-                lines.append(("  " + label, role_style))
-                wrapped = textwrap.wrap(item["content"], width=max(width - 8, 20), replace_whitespace=False) or [""]
-                lines.extend(("       " + line, self.style("text")) for line in wrapped)
-            lines.append(("", 0))
+        lines = self.render_history(width)
 
         if not lines:
             empty_row = max(5, (height - 8) // 2)
             self.add(screen, empty_row, 4, "Start a conversation", self.style("text", curses.A_BOLD))
             self.add(screen, empty_row + 2, 4, "Tab opens the menu. / opens commands.", self.style("muted"))
-        visible = lines[-history_height:]
+        visible, self.scroll_offset, _ = self.history_window(lines, history_height, self.scroll_offset)
         for row, (line, style) in enumerate(visible, start=3):
             self.add(screen, row, 0, line[: max(width - 1, 0)], style)
         self.add(screen, height - 6, 0, "-" * max(width - 1, 0), self.style("border"))
@@ -345,7 +426,11 @@ class Tui:
             self.add(screen, index, 1, line, self.status_style())
         self.add(screen, height - 3, 0, "-" * max(width - 1, 0), self.style("border"))
         self.add(screen, height - 2, 1, ">", self.style("accent", curses.A_BOLD))
-        self.add(screen, height - 1, 1, "Tab Menu   / Commands", self.style("footer"))
+        if self.scroll_offset:
+            footer = "PgUp/PgDn Scroll   {} lines above latest".format(self.scroll_offset)
+        else:
+            footer = "Tab Menu   / Commands   PgUp Scroll   Up Recall"
+        self.add(screen, height - 1, 1, footer[: width - 2], self.style("footer"))
         screen.refresh()
 
     def draw_compact_chat(self, screen: "curses._CursesWindow") -> None:
@@ -353,14 +438,12 @@ class Tui:
         title = " {} | {} ".format(APP_NAME, self.model.label)
         self.add(screen, 0, 0, title[: max(width - 1, 0)], curses.A_REVERSE)
         history_height = max(height - 4, 1)
-        lines: List[Tuple[str, int]] = []
-        for item in self.data["history"]:
-            label = "You" if item["role"] == "user" else item.get("model_id", "Unknown model")
-            wrapped = textwrap.wrap(item["content"], width=max(width - 5, 20), replace_whitespace=False) or [""]
-            lines.append((label + ": " + wrapped[0], curses.A_BOLD))
-            lines.extend(("   " + line, 0) for line in wrapped[1:])
-            lines.append(("", 0))
-        for row, (line, style) in enumerate(lines[-history_height:], start=1):
+        lines = self.render_history(width, compact=True)
+        visible, self.scroll_offset, _ = self.history_window(lines, history_height, self.scroll_offset)
+        if self.scroll_offset:
+            title = "{} | +{} lines".format(title.rstrip(), self.scroll_offset)
+            self.add(screen, 0, 0, title[: max(width - 1, 0)], curses.A_REVERSE)
+        for row, (line, style) in enumerate(visible, start=1):
             self.add(screen, row, 0, line[: max(width - 1, 0)], style)
         self.add(screen, height - 3, 0, "-" * max(width - 1, 0))
         self.add(screen, height - 2, 0, self.status[: max(width - 1, 0)], curses.A_DIM)
@@ -370,6 +453,8 @@ class Tui:
     def read_line(self, screen: "curses._CursesWindow", label: str) -> Optional[str]:
         buffer: List[str] = []
         cursor = 0
+        history_index = len(self.prompt_history)
+        draft: List[str] = []
         while True:
             height, width = screen.getmaxyx()
             prompt_row = height - 2 if height >= 10 and width >= 42 else height - 1
@@ -384,6 +469,14 @@ class Tui:
             screen.refresh()
             key = screen.get_wch()
             if key == curses.KEY_RESIZE:
+                self.draw_chat(screen)
+                continue
+            if key == curses.KEY_PPAGE:
+                self.scroll_offset += max(height - 10, 1)
+                self.draw_chat(screen)
+                continue
+            if key == curses.KEY_NPAGE:
+                self.scroll_offset = max(0, self.scroll_offset - max(height - 10, 1))
                 self.draw_chat(screen)
                 continue
             if key in ("\n", "\r"):
@@ -423,6 +516,18 @@ class Tui:
             if key == curses.KEY_RIGHT:
                 cursor = min(len(buffer), cursor + 1)
                 continue
+            if key == curses.KEY_UP and self.prompt_history:
+                if history_index == len(self.prompt_history):
+                    draft = list(buffer)
+                history_index = max(0, history_index - 1)
+                buffer = list(self.prompt_history[history_index])
+                cursor = len(buffer)
+                continue
+            if key == curses.KEY_DOWN and history_index < len(self.prompt_history):
+                history_index += 1
+                buffer = list(draft if history_index == len(self.prompt_history) else self.prompt_history[history_index])
+                cursor = len(buffer)
+                continue
             if key == curses.KEY_HOME:
                 cursor = 0
                 continue
@@ -446,6 +551,8 @@ class Tui:
         if text.startswith("/"):
             self.handle_command(screen, text)
             return
+        self.remember_prompt(text)
+        self.scroll_offset = 0
         selected_model = self.model
         self.data["history"].append({"role": "user", "content": text})
         self.store.save(self.data)
@@ -479,12 +586,16 @@ class Tui:
                 )
                 self.data["history"].append({"role": "model", "content": answer, "model_id": selected_model.identifier})
             self.status = "Response complete."
+            self.last_failed_prompt = None
         except ApiError as error:
             if self.data["history"] and self.data["history"][-1].get("role") == "model":
                 self.data["history"].pop()
             if self.data["history"] and self.data["history"][-1].get("role") == "user":
                 self.data["history"].pop()
-            self.status = self.friendly_error(error, selected_model)
+            self.last_failed_prompt = text
+            self.status = "{} Use /retry or Up to recall the prompt.".format(
+                self.friendly_error(error, selected_model)
+            )
         self.store.save(self.data)
 
     def friendly_error(self, error: ApiError, model: ModelSpec) -> str:
@@ -497,8 +608,17 @@ class Tui:
 
     def clear_context(self) -> None:
         self.data["history"] = []
+        self.scroll_offset = 0
         self.store.save(self.data)
         self.status = "Context cleared."
+
+    def retry_last(self, screen: "curses._CursesWindow") -> None:
+        if not self.last_failed_prompt:
+            self.status = "There is no failed prompt to retry."
+            return
+        prompt = self.last_failed_prompt
+        self.status = "Retrying the last failed prompt..."
+        self.handle_input(screen, prompt)
 
     def handle_command(self, screen: "curses._CursesWindow", text: str) -> None:
         command, _, argument = text.partition(" ")
@@ -514,12 +634,17 @@ class Tui:
             self.select_model(screen)
         elif command == "/models":
             self.show_models(screen)
+        elif command == "/retry":
+            self.retry_last(screen)
         elif command == "/settings":
             self.open_settings(screen)
         elif command == "/system":
-            self.data["system_instruction"] = argument.strip()
-            self.store.save(self.data)
-            self.status = "System instruction {}.".format("updated" if argument.strip() else "cleared")
+            if argument.strip():
+                self.data["system_instruction"] = argument.strip()
+                self.store.save(self.data)
+                self.status = "System instruction updated."
+            else:
+                self.edit_system_instruction(screen)
         elif command == "/key":
             self.configure_api_key(screen)
         elif command == "/check":
@@ -534,6 +659,7 @@ class Tui:
             ("Choose model", "Browse and filter the model catalog", "model"),
             ("Settings", "Streaming, system instruction, API key, and availability", "settings"),
             ("Clear context", "Remove the shared conversation history", "clear"),
+            ("Retry failed prompt", "Run the most recent failed prompt again", "retry"),
             ("Restart interface", "Close and reopen the terminal interface", "restart"),
             ("Help", "Show shortcuts and slash commands", "help"),
             ("Exit", "Close Gemini Legacy", "exit"),
@@ -579,6 +705,8 @@ class Tui:
                 self.select_model(screen)
             elif action == "settings":
                 self.open_settings(screen)
+            elif action == "retry":
+                self.retry_last(screen)
             elif action == "restart":
                 self.restart_requested = True
                 self.running = False
@@ -688,17 +816,25 @@ class Tui:
             self.add(screen, 0, 2, "COMMANDS", self.style("header", curses.A_BOLD))
             self.add(screen, 2, 2, "/ " + query, self.style("input", curses.A_BOLD))
             self.add(screen, 3, 0, "-" * max(width - 1, 0), self.style("border"))
-            for index, (command, description) in enumerate(matches):
-                row = 5 + index * 2
-                if row >= height - 2:
-                    break
+            visible_count = max((height - 6) // 2, 1)
+            offset = min(
+                max(selected - visible_count + 1, 0),
+                max(len(matches) - visible_count, 0),
+            )
+            for displayed, index in enumerate(
+                range(offset, min(offset + visible_count, len(matches)))
+            ):
+                command, description = matches[index]
+                row = 5 + displayed * 2
                 is_selected = command == selected_command
                 self.add(screen, row, 2, ("> " if is_selected else "  ") + command, self.style("selected") if is_selected else self.style("accent", curses.A_BOLD))
                 if row + 1 < height - 1:
                     self.add(screen, row + 1, 6, description[: width - 8], self.style("muted"))
             if not matches:
                 self.add(screen, 5, 2, "No matching command.", self.style("warning"))
-            self.add(screen, height - 1, 2, "Type to filter   Up/Down select   Enter run   Esc return to input", self.style("footer"))
+            position = "{} / {}".format(selected + 1, len(matches)) if matches else "0 / 0"
+            footer = "Type filter   Up/Down select   Enter run   Esc close   {}".format(position)
+            self.add(screen, height - 1, 2, footer[: width - 4], self.style("footer"))
             screen.refresh()
             key = screen.get_wch()
             if key == "\x1b":
@@ -858,9 +994,10 @@ class Tui:
             "Help",
             [
                 "Tab opens the main menu. Type / for the searchable command palette.",
-                "Settings contains streaming, system instruction, API key, and model availability.",
-                "/clear erases shared context; /model opens the picker; /settings opens settings; /restart reopens the UI.",
-                "/quit exits. API keys are never written to disk. Transcripts live in the selected state folder.",
+                "Page Up and Page Down scroll the transcript. Up and Down recall submitted prompts.",
+                "Settings contains streaming, custom model ID, system instruction, API key, and model availability.",
+                "/clear erases context; /retry repeats a failed prompt; /restart reopens the UI.",
+                "API keys are never written to disk. Transcripts live in the selected state folder.",
             ],
         )
 
@@ -869,22 +1006,46 @@ class Tui:
         self.show_message(screen, "Configured model catalog", lines)
 
     def show_message(self, screen: "curses._CursesWindow", title: str, lines: Sequence[str]) -> None:
-        height, width = screen.getmaxyx()
-        screen.erase()
-        self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("header"))
-        self.add(screen, 0, 1, title[: width - 2], self.style("header", curses.A_BOLD))
-        row = 2
-        for line in lines:
-            for wrapped in textwrap.wrap(line, width=max(width - 2, 20)) or [""]:
-                if row >= height - 2:
-                    break
-                self.add(screen, row, 1, wrapped, self.style("text"))
-                row += 1
-            if row >= height - 2:
-                break
-        self.add(screen, height - 1, 1, "Press any key to return."[: width - 2], self.style("footer"))
-        screen.refresh()
-        screen.get_wch()
+        offset = 0
+        while True:
+            height, width = screen.getmaxyx()
+            wrapped_lines: List[str] = []
+            for line in lines:
+                wrapped_lines.extend(self.wrap_content(line, max(width - 2, 8)))
+            page_height = max(height - 3, 1)
+            maximum_offset = max(len(wrapped_lines) - page_height, 0)
+            offset = min(max(offset, 0), maximum_offset)
+            screen.erase()
+            self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("header"))
+            self.add(screen, 0, 1, title[: width - 2], self.style("header", curses.A_BOLD))
+            for row, line in enumerate(wrapped_lines[offset : offset + page_height], start=2):
+                self.add(screen, row, 1, line[: width - 2], self.style("text"))
+            if wrapped_lines:
+                first = offset + 1
+                last = min(offset + page_height, len(wrapped_lines))
+                position = "{}-{}/{}".format(first, last, len(wrapped_lines))
+            else:
+                position = "0/0"
+            footer = "Up/Down/PgUp/PgDn scroll   Enter/Esc close   {}".format(position)
+            self.add(screen, height - 1, 1, footer[: width - 2], self.style("footer"))
+            screen.refresh()
+            key = screen.get_wch()
+            if key in ("\x1b", "\n", "\r", "q", "Q"):
+                return
+            if key == curses.KEY_RESIZE:
+                continue
+            if key == curses.KEY_UP:
+                offset -= 1
+            elif key == curses.KEY_DOWN:
+                offset += 1
+            elif key == curses.KEY_PPAGE:
+                offset -= page_height
+            elif key == curses.KEY_NPAGE:
+                offset += page_height
+            elif key == curses.KEY_HOME:
+                offset = 0
+            elif key == curses.KEY_END:
+                offset = maximum_offset
 
     @staticmethod
     def add(screen: "curses._CursesWindow", row: int, column: int, value: str, style: int = 0) -> None:
@@ -949,7 +1110,7 @@ class Tui:
 
     def status_style(self) -> int:
         lowered = self.status.lower()
-        if any(token in lowered for token in ("http", "error", "no api key", "network", "invalid")):
+        if any(token in lowered for token in ("http", "error", "no api key", "network", "invalid", "timed out")):
             return self.style("error", curses.A_BOLD)
         if any(token in lowered for token in ("waiting", "checking", "legacy", "unavailable")):
             return self.style("warning")

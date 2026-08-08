@@ -40,7 +40,7 @@ py .\gemini_legacy_tui.py
 
 The API key is optional at launch on every platform; press `F4` inside the app to enter it for the current process. See [WINDOWS.md](WINDOWS.md) for Windows troubleshooting and controls.
 
-The app saves its transcript, chosen model, and system instruction in `./.gemini-legacy-tui/session.json`. It never writes an API key to disk. Supply another location with `--state-dir PATH`.
+The app saves its transcript, chosen model, and system instruction in `./.gemini-legacy-tui/session.json` with private file permissions where the operating system supports them. It repairs malformed session fields when possible and never writes an API key to disk. Supply another location with `--state-dir PATH`.
 
 ## Controls
 
@@ -49,9 +49,12 @@ The app saves its transcript, chosen model, and system instruction in `./.gemini
 | `F1` or `/help` | Help |
 | `Tab` | Main menu |
 | `/` | Searchable slash-command menu |
+| `Page Up` / `Page Down` | Scroll through the reflowed transcript |
+| `Up` / `Down` | Recall previously submitted prompts |
 | `/model` | Searchable model picker |
 | `/settings` | Streaming toggle, system instruction, API key, and availability check |
 | `/clear` | Clear the shared conversation context |
+| `/retry` | Retry the most recent failed prompt |
 | `/restart` or `/reopen` | Close and reopen the TUI without rerunning the shell command |
 | `/models` | Show the built-in catalog |
 | `/quit` | Exit |

@@ -1,10 +1,19 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from gemini_legacy_tui import ApiError, GoogleApiClient, MODEL_BY_ID, MODEL_CATALOG, SessionStore, Tui
+from gemini_legacy_tui import (
+    ApiError,
+    GoogleApiClient,
+    MODEL_BY_ID,
+    MODEL_CATALOG,
+    SLASH_COMMANDS,
+    SessionStore,
+    Tui,
+)
 
 
 class FakeResponse:
@@ -126,6 +135,78 @@ class ClientTests(unittest.TestCase):
             tui = Tui("", store)
         self.assertEqual(tui.model.identifier, "gemini-my-custom-id")
         self.assertEqual(tui.model.protocol, "gemini")
+
+    def test_session_store_repairs_invalid_fields_and_history_items(self):
+        normalized = SessionStore.normalize(
+            {
+                "model": " ",
+                "system_instruction": 123,
+                "settings": {"streaming": "yes"},
+                "history": [
+                    {"role": "user", "content": "hello", "model_id": "ignored"},
+                    {"role": "model", "content": "hi", "model_id": "gemini-test"},
+                    {"role": "assistant", "content": "wrong role"},
+                    {"role": "user", "content": 42},
+                    "not a message",
+                ],
+            }
+        )
+        self.assertEqual(normalized["model"], "gemini-2.5-flash")
+        self.assertEqual(normalized["system_instruction"], "")
+        self.assertTrue(normalized["settings"]["streaming"])
+        self.assertEqual(
+            normalized["history"],
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "model", "content": "hi", "model_id": "gemini-test"},
+            ],
+        )
+
+    @unittest.skipIf(os.name == "nt", "Windows chmod has different permission semantics")
+    def test_session_store_uses_private_file_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.save(SessionStore.normalize({}))
+            mode = store.path.stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_history_window_clamps_and_scrolls_from_latest(self):
+        lines = [(str(index), index) for index in range(10)]
+        visible, offset, maximum = Tui.history_window(lines, height=4, offset=3)
+        self.assertEqual([line for line, _ in visible], ["3", "4", "5", "6"])
+        self.assertEqual(offset, 3)
+        self.assertEqual(maximum, 6)
+
+    def test_wrap_content_preserves_explicit_blank_lines(self):
+        self.assertEqual(Tui.wrap_content("first\n\nsecond", 20), ["first", "", "second"])
+
+    def test_prompt_history_avoids_adjacent_duplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+            tui.remember_prompt("hello")
+            tui.remember_prompt("hello")
+            tui.remember_prompt("different")
+        self.assertEqual(tui.prompt_history, ["hello", "different"])
+
+    def test_retry_reuses_the_last_failed_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+            tui.last_failed_prompt = "try this again"
+            with patch.object(tui, "handle_input") as handle_input:
+                tui.retry_last(object())
+        handle_input.assert_called_once_with(unittest.mock.ANY, "try this again")
+
+    def test_command_palette_lists_every_supported_user_command(self):
+        commands = {command for command, _ in SLASH_COMMANDS}
+        self.assertTrue(
+            {"/clear", "/new", "/model", "/models", "/settings", "/retry", "/system", "/key", "/check", "/restart", "/help", "/quit"}.issubset(commands)
+        )
+
+    @patch("urllib.request.urlopen", side_effect=TimeoutError())
+    def test_timeout_error_is_concise(self, _mocked_open):
+        client = GoogleApiClient("test-key")
+        with self.assertRaisesRegex(ApiError, "Request timed out"):
+            client.generate(MODEL_BY_ID["gemini-2.5-flash"], [{"role": "user", "content": "Hi"}], "")
 
 
 if __name__ == "__main__":
