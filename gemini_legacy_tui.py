@@ -4,8 +4,11 @@
 import argparse
 import json
 import os
+import stat
 import sys
+import tempfile
 import textwrap
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +29,18 @@ except ImportError as error:
 APP_NAME = "Gemini Legacy TUI"
 STATE_FILE_NAME = "session.json"
 USER_AGENT = "gemini-legacy-tui/1.0"
+MAX_API_ERROR_BYTES = 64 * 1024
+MAX_API_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_API_KEY_CHARS = 1024
+MAX_API_KEY_FILE_BYTES = 4 * 1024
+MAX_API_REQUEST_BYTES = 8 * 1024 * 1024
+MAX_DIALOG_CHARS = 64 * 1024
+MAX_INPUT_CHARS = 64 * 1024
+MAX_MODEL_ID_CHARS = 256
+MAX_SESSION_BYTES = 8 * 1024 * 1024
+MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK = 32
+MAX_STREAM_EVENT_BYTES = 1024 * 1024
+MAX_STREAM_TEXT_CHARS = 2 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -74,44 +89,122 @@ class ApiError(RuntimeError):
     """A clean message for API and transport errors."""
 
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep credential headers on the fixed API origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+GOOGLE_API_OPENER = urllib.request.build_opener(NoRedirectHandler())
+
+
+def validate_api_key(value: str) -> str:
+    key = value.strip()
+    if len(key) > MAX_API_KEY_CHARS:
+        raise ApiError("The API key is too long.")
+    if any(character.isspace() or unicodedata.category(character).startswith("C") for character in key):
+        raise ApiError("The API key contains invalid characters.")
+    return key
+
+
+def validate_model_id(value: str) -> str:
+    identifier = value.strip()
+    if not identifier or len(identifier) > MAX_MODEL_ID_CHARS:
+        raise ApiError("The model ID must be between 1 and {} characters.".format(MAX_MODEL_ID_CHARS))
+    if not all(
+        character.isascii() and (character.isalnum() or character in ("-", "_", "."))
+        for character in identifier
+    ):
+        raise ApiError("Model IDs can contain only letters, numbers, hyphens, underscores, and periods.")
+    return identifier
+
+
+def read_api_key_file(path: Path) -> str:
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_API_KEY_FILE_BYTES + 1)
+    if len(raw) > MAX_API_KEY_FILE_BYTES:
+        raise ValueError("the file is too large")
+    return validate_api_key(raw.decode("utf-8"))
+
+
 class GoogleApiClient:
     def __init__(self, api_key: str) -> None:
-        self.api_key = api_key.strip()
+        self.api_key = validate_api_key(api_key)
 
     def _request(self, url: str, body: Optional[dict] = None) -> dict:
         if not self.api_key:
             raise ApiError("No API key. Set GEMINI_API_KEY or press F4 to enter one.")
 
-        headers = {"User-Agent": USER_AGENT}
+        headers = {"User-Agent": USER_AGENT, "x-goog-api-key": self.api_key}
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
+            if len(data) > MAX_API_REQUEST_BYTES:
+                raise ApiError("Conversation context exceeded the request safety limit. Use /clear and try again.")
             headers["Content-Type"] = "application/json"
 
         request = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
         try:
-            with urllib.request.urlopen(request, timeout=90) as response:
-                return json.loads(response.read().decode("utf-8"))
+            with GOOGLE_API_OPENER.open(request, timeout=90) as response:
+                raw = self._read_limited(response, MAX_API_RESPONSE_BYTES, "Google response")
+                parsed = json.loads(raw.decode("utf-8", errors="replace"))
+                if not isinstance(parsed, dict):
+                    raise ApiError("Google returned an unexpected JSON response.")
+                return parsed
         except urllib.error.HTTPError as error:
-            raw = error.read().decode("utf-8", errors="replace")
-            try:
-                message = json.loads(raw).get("error", {}).get("message", raw)
-            except json.JSONDecodeError:
-                message = raw
-            raise ApiError("HTTP {}: {}".format(error.code, message)) from error
+            raise ApiError("HTTP {}: {}".format(error.code, self._http_error_message(error))) from error
         except urllib.error.URLError as error:
             raise ApiError("Network error: {}".format(error.reason)) from error
         except TimeoutError as error:
             raise ApiError("Request timed out. Check the network connection and try again.") from error
+        except OSError as error:
+            raise ApiError("Network error: {}".format(error)) from error
         except json.JSONDecodeError as error:
             raise ApiError("Google returned an invalid JSON response.") from error
 
+    @staticmethod
+    def _read_limited(response: object, limit: int, label: str) -> bytes:
+        raw = response.read(limit + 1)
+        if len(raw) > limit:
+            raise ApiError("{} exceeded the {} byte safety limit.".format(label, limit))
+        return raw
+
+    def _http_error_message(self, error: urllib.error.HTTPError) -> str:
+        try:
+            raw_bytes = error.read(MAX_API_ERROR_BYTES + 1)
+        except (AttributeError, OSError):
+            raw_bytes = b""
+        truncated = len(raw_bytes) > MAX_API_ERROR_BYTES
+        raw = raw_bytes[:MAX_API_ERROR_BYTES].decode("utf-8", errors="replace").strip()
+        message = raw
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                details = parsed.get("error")
+                if isinstance(details, dict) and isinstance(details.get("message"), str):
+                    message = details["message"]
+        except json.JSONDecodeError:
+            pass
+        if not message:
+            message = str(error.reason or "request failed")
+        if self.api_key:
+            message = message.replace(self.api_key, "[redacted]")
+        if truncated:
+            message += " [truncated]"
+        return message
+
     def list_models(self) -> List[str]:
-        url = "https://generativelanguage.googleapis.com/v1beta/models?key={}".format(
-            urllib.parse.quote(self.api_key, safe="")
-        )
+        url = "https://generativelanguage.googleapis.com/v1beta/models"
         response = self._request(url)
-        return [model.get("name", "").removeprefix("models/") for model in response.get("models", [])]
+        models = response.get("models", [])
+        if not isinstance(models, list):
+            raise ApiError("Google returned an unexpected model list.")
+        return [
+            model.get("name", "").removeprefix("models/")
+            for model in models
+            if isinstance(model, dict) and isinstance(model.get("name"), str)
+        ]
 
     def generate(self, model: ModelSpec, history: Sequence[Dict[str, str]], system_instruction: str) -> str:
         if model.protocol == "palm":
@@ -145,18 +238,27 @@ class GoogleApiClient:
         return body
 
     def _generate_gemini(self, model: ModelSpec, history: Sequence[Dict[str, str]], system_instruction: str) -> str:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}".format(
-            urllib.parse.quote(model.identifier, safe=""), urllib.parse.quote(self.api_key, safe="")
+        url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent".format(
+            urllib.parse.quote(model.identifier, safe="")
         )
         response = self._request(url, self._gemini_body(history, system_instruction))
         candidates = response.get("candidates", [])
-        if not candidates:
-            detail = response.get("promptFeedback", {}).get("blockReason", "no candidate returned")
+        if not isinstance(candidates, list) or not candidates:
+            feedback = response.get("promptFeedback", {})
+            detail = feedback.get("blockReason", "no candidate returned") if isinstance(feedback, dict) else "no candidate returned"
             raise ApiError("The request produced no response: {}.".format(detail))
-        parts = candidates[0].get("content", {}).get("parts", [])
-        text = "\n".join(part["text"] for part in parts if "text" in part).strip()
+        first = candidates[0] if isinstance(candidates[0], dict) else {}
+        content = first.get("content", {})
+        parts = content.get("parts", []) if isinstance(content, dict) else []
+        text = "\n".join(
+            part["text"]
+            for part in parts
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ).strip()
         if not text:
             raise ApiError("The selected model returned no text.")
+        if len(text) > MAX_STREAM_TEXT_CHARS:
+            raise ApiError("The response exceeded the safety limit.")
         return text
 
     def _stream_gemini(
@@ -168,15 +270,29 @@ class GoogleApiClient:
     ) -> str:
         if not self.api_key:
             raise ApiError("No API key. Set GEMINI_API_KEY or press F4 to enter one.")
-        url = "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}".format(
-            urllib.parse.quote(model.identifier, safe=""), urllib.parse.quote(self.api_key, safe="")
+        url = "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse".format(
+            urllib.parse.quote(model.identifier, safe="")
         )
-        headers = {"User-Agent": USER_AGENT, "Content-Type": "application/json", "Accept": "text/event-stream"}
-        request = urllib.request.Request(url, data=json.dumps(self._gemini_body(history, system_instruction)).encode("utf-8"), headers=headers, method="POST")
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "x-goog-api-key": self.api_key,
+        }
+        request_data = json.dumps(self._gemini_body(history, system_instruction)).encode("utf-8")
+        if len(request_data) > MAX_API_REQUEST_BYTES:
+            raise ApiError("Conversation context exceeded the request safety limit. Use /clear and try again.")
+        request = urllib.request.Request(url, data=request_data, headers=headers, method="POST")
         received: List[str] = []
+        received_chars = 0
         try:
-            with urllib.request.urlopen(request, timeout=90) as response:
-                for raw_line in response:
+            with GOOGLE_API_OPENER.open(request, timeout=90) as response:
+                while True:
+                    raw_line = response.readline(MAX_STREAM_EVENT_BYTES + 1)
+                    if not raw_line:
+                        break
+                    if len(raw_line) > MAX_STREAM_EVENT_BYTES:
+                        raise ApiError("A streaming event exceeded the safety limit.")
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
                         continue
@@ -184,25 +300,33 @@ class GoogleApiClient:
                         event = json.loads(line[5:].strip())
                     except json.JSONDecodeError as error:
                         raise ApiError("Google returned an invalid streaming event.") from error
+                    if not isinstance(event, dict):
+                        raise ApiError("Google returned an unexpected streaming event.")
                     candidates = event.get("candidates", [])
-                    if not candidates:
+                    if not isinstance(candidates, list) or not candidates:
                         continue
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    chunk = "".join(part["text"] for part in parts if "text" in part)
+                    first = candidates[0] if isinstance(candidates[0], dict) else {}
+                    content = first.get("content", {})
+                    parts = content.get("parts", []) if isinstance(content, dict) else []
+                    chunk = "".join(
+                        part["text"]
+                        for part in parts
+                        if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    )
                     if chunk:
+                        received_chars += len(chunk)
+                        if received_chars > MAX_STREAM_TEXT_CHARS:
+                            raise ApiError("The streamed response exceeded the safety limit.")
                         received.append(chunk)
                         on_text(chunk)
         except urllib.error.HTTPError as error:
-            raw = error.read().decode("utf-8", errors="replace")
-            try:
-                message = json.loads(raw).get("error", {}).get("message", raw)
-            except json.JSONDecodeError:
-                message = raw
-            raise ApiError("HTTP {}: {}".format(error.code, message)) from error
+            raise ApiError("HTTP {}: {}".format(error.code, self._http_error_message(error))) from error
         except urllib.error.URLError as error:
             raise ApiError("Network error: {}".format(error.reason)) from error
         except TimeoutError as error:
             raise ApiError("Request timed out. Check the network connection and try again.") from error
+        except OSError as error:
+            raise ApiError("Network error: {}".format(error)) from error
         text = "".join(received).strip()
         if not text:
             raise ApiError("The selected model returned no text.")
@@ -211,8 +335,8 @@ class GoogleApiClient:
     def _generate_palm(self, model: ModelSpec, history: Sequence[Dict[str, str]], system_instruction: str) -> str:
         # PaLM Chat used a different, now-retired API shape. Keeping this request
         # lets accounts with an available legacy endpoint attempt the original model.
-        url = "https://generativelanguage.googleapis.com/v1beta3/models/{}:generateMessage?key={}".format(
-            urllib.parse.quote(model.identifier, safe=""), urllib.parse.quote(self.api_key, safe="")
+        url = "https://generativelanguage.googleapis.com/v1beta3/models/{}:generateMessage".format(
+            urllib.parse.quote(model.identifier, safe="")
         )
         messages = [
             {"author": "0" if item["role"] == "user" else "1", "content": item["content"]}
@@ -230,9 +354,19 @@ class GoogleApiClient:
                 ) from error
             raise
         candidates = response.get("candidates", [])
-        if not candidates or not candidates[0].get("content"):
+        if (
+            not isinstance(candidates, list)
+            or not candidates
+            or not isinstance(candidates[0], dict)
+            or not isinstance(candidates[0].get("content"), str)
+        ):
             raise ApiError("The PaLM endpoint returned no text.")
-        return candidates[0]["content"].strip()
+        text = candidates[0]["content"].strip()
+        if not text:
+            raise ApiError("The PaLM endpoint returned no text.")
+        if len(text) > MAX_STREAM_TEXT_CHARS:
+            raise ApiError("The response exceeded the safety limit.")
+        return text
 
 
 class SessionStore:
@@ -241,10 +375,28 @@ class SessionStore:
 
     def load(self) -> dict:
         try:
-            with self.path.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
+            if self.path.is_symlink():
+                return self.normalize({})
+            flags = os.O_RDONLY
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_NONBLOCK", 0)
+            descriptor = os.open(str(self.path), flags)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_SESSION_BYTES:
+                    return self.normalize({})
+                with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                    descriptor = -1
+                    raw = handle.read(MAX_SESSION_BYTES + 1)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            if len(raw.encode("utf-8")) > MAX_SESSION_BYTES:
+                return self.normalize({})
+            data = json.loads(raw)
             return self.normalize(data)
-        except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+        except (FileNotFoundError, OSError, UnicodeError, ValueError, json.JSONDecodeError):
             return self.normalize({})
 
     @staticmethod
@@ -252,7 +404,9 @@ class SessionStore:
         if not isinstance(data, dict):
             data = {}
         model = data.get("model", DEFAULT_MODEL_ID)
-        if not isinstance(model, str) or not model.strip():
+        try:
+            model = validate_model_id(model) if isinstance(model, str) else DEFAULT_MODEL_ID
+        except ApiError:
             model = DEFAULT_MODEL_ID
         system_instruction = data.get("system_instruction", "")
         if not isinstance(system_instruction, str):
@@ -275,23 +429,47 @@ class SessionStore:
         settings = data.get("settings", {})
         streaming = settings.get("streaming", True) if isinstance(settings, dict) else True
         return {
-            "model": model.strip(),
+            "model": model,
             "system_instruction": system_instruction,
             "history": history,
             "settings": {"streaming": streaming if isinstance(streaming, bool) else True},
         }
 
     def save(self, data: dict) -> None:
+        temporary: Optional[Path] = None
+        descriptor: Optional[int] = None
         try:
+            serialized = json.dumps(data, indent=2, ensure_ascii=True).encode("utf-8")
+            if len(serialized) > MAX_SESSION_BYTES:
+                return
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(".tmp")
-            with temporary.open("w", encoding="utf-8") as handle:
-                json.dump(data, handle, indent=2, ensure_ascii=True)
-            os.chmod(temporary, 0o600)
-            temporary.replace(self.path)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".session-", suffix=".tmp", dir=str(self.path.parent), text=True
+            )
+            temporary = Path(temporary_name)
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = None
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(temporary), str(self.path))
+            temporary = None
             os.chmod(self.path, 0o600)
         except OSError:
             pass  # A read-only directory should not stop a chat session.
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
 
 
 class Tui:
@@ -374,7 +552,10 @@ class Tui:
 
     def run(self, screen: "curses._CursesWindow") -> None:
         self.initialize_theme(screen)
-        curses.curs_set(1)
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
         screen.keypad(True)
         screen.timeout(-1)
         while self.running:
@@ -465,7 +646,13 @@ class Tui:
             rendered = visible[start : start + available_width]
             self.add(screen, prompt_row, 0, " " * max(width - 1, 0))
             self.add(screen, prompt_row, 1 if prompt_row != height - 1 else 0, prompt_label + rendered, self.style("input"))
-            screen.move(prompt_row, min((1 if prompt_row != height - 1 else 0) + len(prompt_label) + cursor - start, width - 1))
+            try:
+                screen.move(
+                    prompt_row,
+                    min((1 if prompt_row != height - 1 else 0) + len(prompt_label) + cursor - start, width - 1),
+                )
+            except curses.error:
+                pass
             screen.refresh()
             key = screen.get_wch()
             if key == curses.KEY_RESIZE:
@@ -535,6 +722,13 @@ class Tui:
                 cursor = len(buffer)
                 continue
             if isinstance(key, str) and key.isprintable():
+                if len(buffer) >= MAX_INPUT_CHARS:
+                    self.status = "Prompt limit reached ({} characters).".format(MAX_INPUT_CHARS)
+                    try:
+                        curses.beep()
+                    except curses.error:
+                        pass
+                    continue
                 buffer.insert(cursor, key)
                 cursor += 1
                 if "".join(buffer) == "/":
@@ -640,7 +834,7 @@ class Tui:
             self.open_settings(screen)
         elif command == "/system":
             if argument.strip():
-                self.data["system_instruction"] = argument.strip()
+                self.data["system_instruction"] = argument.strip()[:MAX_DIALOG_CHARS]
                 self.store.save(self.data)
                 self.status = "System instruction updated."
             else:
@@ -779,11 +973,19 @@ class Tui:
                 self.store.save(self.data)
                 self.status = "Streaming {}.".format("enabled" if self.streaming_enabled else "disabled")
             elif action == "custom_model":
-                value = self.prompt_dialog(screen, "Custom Gemini model ID", self.data["model"])
+                value = self.prompt_dialog(
+                    screen,
+                    "Custom Gemini model ID",
+                    self.data["model"],
+                    max_length=MAX_MODEL_ID_CHARS,
+                )
                 if value:
-                    self.data["model"] = value
-                    self.store.save(self.data)
-                    self.status = "Selected custom model {}. Shared context is retained.".format(value)
+                    try:
+                        self.data["model"] = validate_model_id(value)
+                        self.store.save(self.data)
+                        self.status = "Selected custom model {}. Shared context is retained.".format(value)
+                    except ApiError as error:
+                        self.status = str(error)
             elif action == "system":
                 self.edit_system_instruction(screen)
             elif action == "key":
@@ -853,7 +1055,7 @@ class Tui:
                 query = query[:-1]
             elif key == "\x15":
                 query = ""
-            elif isinstance(key, str) and key.isprintable():
+            elif isinstance(key, str) and key.isprintable() and len(query) < 128:
                 query += key
 
     def select_model(self, screen: "curses._CursesWindow") -> None:
@@ -920,7 +1122,7 @@ class Tui:
                 query = query[:-1]
             elif key == "\x15":
                 query = ""
-            elif isinstance(key, str) and key.isprintable() and key not in ("j", "k"):
+            elif isinstance(key, str) and key.isprintable() and key not in ("j", "k") and len(query) < 128:
                 query += key
 
     def availability_marker(self, model: ModelSpec) -> str:
@@ -939,28 +1141,52 @@ class Tui:
             self.status = str(error)
 
     def edit_system_instruction(self, screen: "curses._CursesWindow") -> None:
-        value = self.prompt_dialog(screen, "System instruction", self.data.get("system_instruction", ""))
+        value = self.prompt_dialog(
+            screen,
+            "System instruction",
+            self.data.get("system_instruction", ""),
+            max_length=MAX_DIALOG_CHARS,
+        )
         if value is not None:
             self.data["system_instruction"] = value
             self.store.save(self.data)
             self.status = "System instruction {}.".format("updated" if value else "cleared")
 
     def configure_api_key(self, screen: "curses._CursesWindow") -> None:
-        value = self.prompt_dialog(screen, "API key (kept only for this run)", "", secret=True)
+        value = self.prompt_dialog(
+            screen,
+            "API key (kept only for this run)",
+            "",
+            secret=True,
+            max_length=MAX_API_KEY_CHARS,
+        )
         if value:
-            self.api_key = value.strip()
-            self.available_models = None
-            self.status = "API key updated for this session."
+            try:
+                self.api_key = validate_api_key(value)
+                self.available_models = None
+                self.status = "API key updated for this session."
+            except ApiError as error:
+                self.status = str(error)
         elif value == "":
             self.status = "API key was unchanged."
 
-    def prompt_dialog(self, screen: "curses._CursesWindow", title: str, initial: str, secret: bool = False) -> Optional[str]:
+    def prompt_dialog(
+        self,
+        screen: "curses._CursesWindow",
+        title: str,
+        initial: str,
+        secret: bool = False,
+        max_length: int = MAX_DIALOG_CHARS,
+    ) -> Optional[str]:
         height, width = screen.getmaxyx()
         window_height = 7
+        if height < window_height or width < 20:
+            self.status = "Terminal is too small for this dialog. Resize it and try again."
+            return None
         window_width = min(max(50, len(title) + 8), max(width - 2, 20))
         window = curses.newwin(window_height, window_width, max((height - window_height) // 2, 0), max((width - window_width) // 2, 0))
         window.keypad(True)
-        buffer = list(initial)
+        buffer = list(initial[:max_length])
         cursor = len(buffer)
         while True:
             window.erase()
@@ -970,7 +1196,10 @@ class Tui:
             start = max(0, cursor - (window_width - 6))
             self.add(window, 3, 2, shown[start : start + window_width - 5])
             self.add(window, 5, 2, "Enter: confirm  Esc: cancel"[: window_width - 4], curses.A_DIM)
-            window.move(3, min(2 + cursor - start, window_width - 3))
+            try:
+                window.move(3, min(2 + cursor - start, window_width - 3))
+            except curses.error:
+                pass
             window.refresh()
             key = window.get_wch()
             if key in ("\n", "\r"):
@@ -985,6 +1214,12 @@ class Tui:
             elif key == curses.KEY_RIGHT:
                 cursor = min(len(buffer), cursor + 1)
             elif isinstance(key, str) and key.isprintable():
+                if len(buffer) >= max_length:
+                    try:
+                        curses.beep()
+                    except curses.error:
+                        pass
+                    continue
                 buffer.insert(cursor, key)
                 cursor += 1
 
@@ -1050,14 +1285,35 @@ class Tui:
     @staticmethod
     def add(screen: "curses._CursesWindow", row: int, column: int, value: str, style: int = 0) -> None:
         try:
-            screen.addstr(row, column, value, style)
+            screen.addstr(row, column, Tui.sanitize_display(value), style)
         except curses.error:
             pass
 
     @staticmethod
+    def sanitize_display(value: str) -> str:
+        """Remove control and formatting characters before writing to a terminal."""
+        cleaned: List[str] = []
+        for character in str(value):
+            if character == "\t":
+                cleaned.append("    ")
+            elif character in ("\r", "\n"):
+                cleaned.append(" ")
+            elif unicodedata.category(character) in ("Cc", "Cf", "Cs"):
+                continue
+            else:
+                cleaned.append(character)
+        return "".join(cleaned)
+
+    @staticmethod
     def display_fragments(chunk: str, width: int = 16) -> List[str]:
         """Keep SSE responses visibly progressive when a provider sends a large chunk."""
-        return [chunk[index : index + width] for index in range(0, len(chunk), width)] or [""]
+        minimum_width = max(width, 1)
+        fragment_width = max(
+            minimum_width,
+            (len(chunk) + MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK - 1)
+            // MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK,
+        )
+        return [chunk[index : index + fragment_width] for index in range(0, len(chunk), fragment_width)] or [""]
 
     @staticmethod
     def show_cursor() -> None:
@@ -1117,7 +1373,7 @@ class Tui:
         return self.style("ok")
 
     def status_lines(self, width: int) -> List[str]:
-        lines = textwrap.wrap(self.status, width=max(width - 3, 20), break_long_words=False) or [""]
+        lines = textwrap.wrap(self.status, width=max(width - 3, 20), break_long_words=True) or [""]
         if len(lines) > 2:
             lines = [lines[0], lines[1] + " ..."]
         return lines + [""] * (2 - len(lines))
@@ -1125,7 +1381,11 @@ class Tui:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Terminal UI for Gemini Flash and legacy PaLM chat models.")
-    parser.add_argument("--api-key", help="Gemini API key. Overrides GEMINI_API_KEY and GOOGLE_API_KEY.")
+    parser.add_argument(
+        "--api-key-file",
+        type=Path,
+        help="Read the Gemini API key from a file instead of exposing it in command-line arguments.",
+    )
     parser.add_argument(
         "--state-dir",
         type=Path,
@@ -1143,7 +1403,24 @@ def main() -> int:
             print("{}\t{}\t{}".format(model.identifier, model.group, model.availability_note))
         return 0
     restart_key = os.environ.pop("GEMINI_LEGACY_TUI_RESTART_KEY", "")
-    api_key = arguments.api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or restart_key
+    api_key_from_file = ""
+    if arguments.api_key_file:
+        try:
+            api_key_from_file = read_api_key_file(arguments.api_key_file)
+        except (ApiError, OSError, UnicodeError, ValueError) as error:
+            print("Could not read API key file: {}".format(error), file=sys.stderr)
+            return 2
+    api_key = (
+        api_key_from_file
+        or os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+        or restart_key
+    )
+    try:
+        api_key = validate_api_key(api_key)
+    except ApiError as error:
+        print("Could not use API key: {}".format(error), file=sys.stderr)
+        return 2
     store = SessionStore(arguments.state_dir)
     app = Tui(api_key, store)
     try:

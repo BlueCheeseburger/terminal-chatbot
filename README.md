@@ -40,7 +40,9 @@ py .\gemini_legacy_tui.py
 
 The API key is optional at launch on every platform; press `F4` inside the app to enter it for the current process. See [WINDOWS.md](WINDOWS.md) for Windows troubleshooting and controls.
 
-The app saves its transcript, chosen model, and system instruction in `./.gemini-legacy-tui/session.json` with private file permissions where the operating system supports them. It repairs malformed session fields when possible and never writes an API key to disk. Supply another location with `--state-dir PATH`.
+To load a key from a private file, use `python3 gemini_legacy_tui.py --api-key-file PATH`. The app sends API keys in Google's `x-goog-api-key` header, never places them in request URLs, and does not accept secrets as command-line values where process listings could expose them.
+
+The app saves its transcript, chosen model, and system instruction in `./.gemini-legacy-tui/session.json` with private file permissions where the operating system supports them. It repairs malformed session fields when possible, refuses symlinked or oversized session files, and never writes an API key to disk. Supply another location with `--state-dir PATH`.
 
 ## Controls
 
