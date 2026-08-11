@@ -11,12 +11,15 @@ import gemini_legacy_tui as app
 from gemini_legacy_tui import (
     ApiError,
     DEFAULT_SYSTEM_INSTRUCTION,
+    DEFAULT_THEME_ID,
     GoogleApiClient,
     MAX_API_RESPONSE_BYTES,
     MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK,
     MAX_STREAM_EVENT_BYTES,
     MODEL_BY_ID,
     MODEL_CATALOG,
+    THEME_BY_ID,
+    THEMES,
     NoRedirectHandler,
     SLASH_COMMANDS,
     SessionStore,
@@ -65,6 +68,19 @@ class ClientTests(unittest.TestCase):
         identifiers = [model.identifier for model in MODEL_CATALOG]
         self.assertFalse(any("lite" in model or "pro" in model or "text-bison" in model for model in identifiers))
         self.assertFalse(any("image" in model for model in identifiers))
+
+    def test_theme_catalog_includes_matrix_green_and_default_theme(self):
+        self.assertIn("matrix", THEME_BY_ID)
+        self.assertEqual(THEME_BY_ID["matrix"].label, "Matrix Green")
+        self.assertEqual([theme.identifier for theme in THEMES][0], DEFAULT_THEME_ID)
+
+    def test_session_theme_selection_persists_and_invalid_values_fall_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.save({"settings": {"theme": "matrix"}})
+            tui = Tui("", store)
+        self.assertEqual(tui.theme.identifier, "matrix")
+        self.assertEqual(SessionStore.normalize({"settings": {"theme": "unknown"}})["settings"]["theme"], DEFAULT_THEME_ID)
 
     @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open")
     def test_gemini_uses_generate_content_schema(self, mocked_open):
@@ -258,6 +274,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(normalized["system_instruction"], DEFAULT_SYSTEM_INSTRUCTION)
         self.assertTrue(normalized["settings"]["streaming"])
         self.assertFalse(normalized["settings"]["system_instruction_configured"])
+        self.assertEqual(normalized["settings"]["theme"], DEFAULT_THEME_ID)
         self.assertEqual(
             normalized["history"],
             [

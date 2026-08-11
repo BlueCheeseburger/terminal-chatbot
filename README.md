@@ -54,7 +54,7 @@ The app saves its transcript, chosen model, and system instruction in `./.gemini
 | `Page Up` / `Page Down` or `Ctrl+U` / `Ctrl+D` | Scroll through the reflowed transcript |
 | `Up` / `Down` | Recall previously submitted prompts |
 | `/model` | Searchable model picker |
-| `/settings` | Streaming toggle, system instruction, API key, and availability check |
+| `/settings` | Streaming toggle, theme picker, system instruction, API key, and availability check |
 | `/transcript` | Open the complete transcript reader with Up/Down scrolling |
 | `/clear` | Clear the shared conversation context |
 | `/retry` | Retry the most recent failed prompt |
@@ -97,7 +97,7 @@ The availability check is deliberately advisory: it uses the current `models.lis
 
 Gemini entries stream by default through `v1beta/models/{model}:streamGenerateContent`; toggle Streaming off in Settings to use the non-streaming `generateContent` endpoint instead. `chat-bison-001` uses the old PaLM `v1beta3/models/chat-bison-001:generateMessage` request shape. Keeping those code paths separate is important: PaLM Chat was a conversational API and does not accept the modern Gemini `contents` schema.
 
-Settings also accepts a custom Gemini model ID. Custom IDs use the modern Gemini API and appear on replies exactly as entered. Terminal controls font size rather than the TUI. macOS Terminal uses `Command-Plus` and `Command-Minus` and may resize its window while zooming; Windows Terminal uses `Ctrl-Plus` and `Ctrl-Minus`. A curses app cannot override the terminal application's font behavior.
+Settings includes persistent terminal themes: Midnight Cyan, Matrix Green, Amber CRT, Arctic Blue, and Neon Noir. Matrix Green uses green text on a black background. Settings also accepts a custom Gemini model ID. Custom IDs use the modern Gemini API and appear on replies exactly as entered. Terminal controls font size rather than the TUI. macOS Terminal uses `Command-Plus` and `Command-Minus` and may resize its window while zooming; Windows Terminal uses `Ctrl-Plus` and `Ctrl-Minus`. A curses app cannot override the terminal application's font behavior.
 
 New sessions include an editable system instruction that tells models they are responding inside a terminal, to use plain text without Markdown emphasis or visual styling, and that blank lines between blocks are acceptable. Open Settings or run `/system` to view or change it.
 

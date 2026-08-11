@@ -54,6 +54,92 @@ class ModelSpec:
     availability_note: str
 
 
+@dataclass(frozen=True)
+class ThemeSpec:
+    identifier: str
+    label: str
+    description: str
+    header: int
+    accent: int
+    text: int
+    user: int
+    warning: int
+    error: int
+    selected_text: int
+    selected_background: int
+
+
+THEMES: Sequence[ThemeSpec] = (
+    ThemeSpec(
+        "midnight",
+        "Midnight Cyan",
+        "Cyan signals on a calm black canvas",
+        curses.COLOR_CYAN,
+        curses.COLOR_CYAN,
+        curses.COLOR_WHITE,
+        curses.COLOR_GREEN,
+        curses.COLOR_YELLOW,
+        curses.COLOR_RED,
+        curses.COLOR_BLACK,
+        curses.COLOR_CYAN,
+    ),
+    ThemeSpec(
+        "matrix",
+        "Matrix Green",
+        "Green phosphor text on pure black",
+        curses.COLOR_GREEN,
+        curses.COLOR_GREEN,
+        curses.COLOR_GREEN,
+        curses.COLOR_GREEN,
+        curses.COLOR_YELLOW,
+        curses.COLOR_RED,
+        curses.COLOR_BLACK,
+        curses.COLOR_GREEN,
+    ),
+    ThemeSpec(
+        "amber",
+        "Amber CRT",
+        "Warm amber prompts with a crisp monochrome body",
+        curses.COLOR_YELLOW,
+        curses.COLOR_YELLOW,
+        curses.COLOR_WHITE,
+        curses.COLOR_YELLOW,
+        curses.COLOR_MAGENTA,
+        curses.COLOR_RED,
+        curses.COLOR_BLACK,
+        curses.COLOR_YELLOW,
+    ),
+    ThemeSpec(
+        "arctic",
+        "Arctic Blue",
+        "Cool blue structure with cyan conversation markers",
+        curses.COLOR_BLUE,
+        curses.COLOR_CYAN,
+        curses.COLOR_WHITE,
+        curses.COLOR_CYAN,
+        curses.COLOR_YELLOW,
+        curses.COLOR_RED,
+        curses.COLOR_WHITE,
+        curses.COLOR_BLUE,
+    ),
+    ThemeSpec(
+        "neon",
+        "Neon Noir",
+        "Magenta headers and cyan responses on black",
+        curses.COLOR_MAGENTA,
+        curses.COLOR_CYAN,
+        curses.COLOR_WHITE,
+        curses.COLOR_GREEN,
+        curses.COLOR_YELLOW,
+        curses.COLOR_RED,
+        curses.COLOR_BLACK,
+        curses.COLOR_MAGENTA,
+    ),
+)
+THEME_BY_ID = {theme.identifier: theme for theme in THEMES}
+DEFAULT_THEME_ID = "midnight"
+
+
 MODEL_CATALOG: Sequence[ModelSpec] = (
     ModelSpec("gemini-3.6-flash", "Gemini 3.6 Flash", "Main Gemini Flash", "gemini", "Current stable"),
     ModelSpec("gemini-3.5-flash", "Gemini 3.5 Flash", "Main Gemini Flash", "gemini", "Current stable"),
@@ -440,6 +526,9 @@ class SessionStore:
                 history.append(normalized)
         settings = data.get("settings", {})
         streaming = settings.get("streaming", True) if isinstance(settings, dict) else True
+        theme = settings.get("theme", DEFAULT_THEME_ID) if isinstance(settings, dict) else DEFAULT_THEME_ID
+        if not isinstance(theme, str) or theme not in THEME_BY_ID:
+            theme = DEFAULT_THEME_ID
         default_instruction_configured = isinstance(raw_system_instruction, str) and bool(raw_system_instruction)
         system_instruction_configured = (
             settings.get("system_instruction_configured", default_instruction_configured)
@@ -457,6 +546,7 @@ class SessionStore:
             "settings": {
                 "streaming": streaming if isinstance(streaming, bool) else True,
                 "system_instruction_configured": system_instruction_configured,
+                "theme": theme,
             },
         }
 
@@ -508,6 +598,7 @@ class Tui:
             self.data["settings"] = {}
         self.data["settings"].setdefault("streaming", True)
         self.data["settings"].setdefault("system_instruction_configured", False)
+        self.data["settings"].setdefault("theme", DEFAULT_THEME_ID)
         self.status = "Ready"
         self.available_models: Optional[set] = None
         self.running = True
@@ -530,6 +621,10 @@ class Tui:
     @property
     def streaming_enabled(self) -> bool:
         return bool(self.data["settings"].get("streaming", True))
+
+    @property
+    def theme(self) -> ThemeSpec:
+        return THEME_BY_ID.get(self.data["settings"].get("theme"), THEME_BY_ID[DEFAULT_THEME_ID])
 
     @staticmethod
     def wrap_content(content: str, width: int) -> List[str]:
@@ -892,7 +987,7 @@ class Tui:
     def open_action_menu(self, screen: "curses._CursesWindow") -> None:
         actions = (
             ("Choose model", "Browse and filter the model catalog", "model"),
-            ("Settings", "Streaming, system instruction, API key, and availability", "settings"),
+            ("Settings", "Themes, streaming, system instruction, API key, and availability", "settings"),
             ("View transcript", "Read the complete rewrapped conversation", "transcript"),
             ("Clear context", "Remove the shared conversation history", "clear"),
             ("Retry failed prompt", "Run the most recent failed prompt again", "retry"),
@@ -959,6 +1054,7 @@ class Tui:
         selected = 0
         settings = (
             ("Streaming", "Render Gemini output as it arrives", "stream"),
+            ("Theme", "Choose the terminal color palette", "theme"),
             ("Custom model ID", "Use a Gemini model ID not in the catalog", "custom_model"),
             ("System instruction", "Set or clear the instruction for this chat", "system"),
             ("API key", "Enter an API key for this run only", "key"),
@@ -983,24 +1079,28 @@ class Tui:
             self.add(screen, 2, 2, font_hint, self.style("muted"))
             self.add(screen, 3, 0, "-" * max(width - 1, 0), self.style("border"))
             for index, (label, description, _) in enumerate(settings):
-                row = 5 + index * 3
+                row = 5 + index * 2
                 if row >= height - 2:
                     break
                 marker = ">" if index == selected else " "
                 style = self.style("selected") if index == selected else self.style("text")
-                value = "[ON]" if label == "Streaming" and self.streaming_enabled else "[OFF]" if label == "Streaming" else ""
-                self.add(screen, row, 2, "{}  {: <22} {}".format(marker, label, value)[: width - 4], style)
-                if row + 1 < height - 1:
-                    self.add(screen, row + 1, 5, description[: width - 7], self.style("muted"))
-                if label == "Custom model ID" and self.data["model"] not in MODEL_BY_ID and row + 2 < height - 1:
-                    self.add(screen, row + 2, 5, self.data["model"][: width - 7], self.style("accent"))
-                if label == "System instruction" and row + 2 < height - 1:
-                    instruction_state = (
+                if label == "Streaming":
+                    value = "[ON]" if self.streaming_enabled else "[OFF]"
+                elif label == "Theme":
+                    value = self.theme.label
+                elif label == "Custom model ID" and self.data["model"] not in MODEL_BY_ID:
+                    value = self.data["model"]
+                elif label == "System instruction":
+                    value = (
                         "Custom"
                         if self.data["settings"].get("system_instruction_configured")
                         else "Terminal default"
                     )
-                    self.add(screen, row + 2, 5, instruction_state, self.style("accent"))
+                else:
+                    value = ""
+                self.add(screen, row, 2, "{}  {: <22} {}".format(marker, label, value)[: width - 4], style)
+                if row + 1 < height - 1:
+                    self.add(screen, row + 1, 5, description[: width - 7], self.style("muted"))
             self.add(screen, height - 1, 2, "Up/Down select   Enter open   Space toggle   Esc close", self.style("footer"))
             screen.refresh()
             key = screen.get_wch()
@@ -1021,6 +1121,8 @@ class Tui:
                 self.data["settings"]["streaming"] = not self.streaming_enabled
                 self.store.save(self.data)
                 self.status = "Streaming {}.".format("enabled" if self.streaming_enabled else "disabled")
+            elif action == "theme":
+                self.select_theme(screen)
             elif action == "custom_model":
                 value = self.prompt_dialog(
                     screen,
@@ -1044,6 +1146,55 @@ class Tui:
             elif action == "back":
                 break
         self.show_cursor()
+
+    def select_theme(self, screen: "curses._CursesWindow") -> None:
+        selected_id = self.theme.identifier
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        while True:
+            screen.erase()
+            height, width = screen.getmaxyx()
+            self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("base"))
+            self.add(screen, 0, 2, "THEMES", self.style("header", curses.A_BOLD))
+            self.add(screen, 2, 2, "Choose a palette. Enter applies it. Esc returns to Settings.", self.style("muted"))
+            self.add(screen, 3, 0, "-" * max(width - 1, 0), self.style("border"))
+            selected = next(
+                (index for index, theme in enumerate(THEMES) if theme.identifier == selected_id),
+                0,
+            )
+            for index, theme in enumerate(THEMES):
+                row = 5 + index * 3
+                if row >= height - 2:
+                    break
+                is_selected = theme.identifier == selected_id
+                marker = ">" if is_selected else " "
+                style = self.style("selected") if is_selected else self.style("text")
+                self.add(screen, row, 2, "{}  {}".format(marker, theme.label)[: width - 4], style)
+                if row + 1 < height - 1:
+                    self.add(screen, row + 1, 5, theme.description[: width - 7], self.style("muted"))
+                if row + 2 < height - 1:
+                    preview = "YOU  sample prompt     GEMINI  sample response"
+                    self.add(screen, row + 2, 5, preview[: width - 7], self.style("accent"))
+            self.add(screen, height - 1, 2, "Up/Down select   Enter apply   Esc close", self.style("footer"))
+            screen.refresh()
+            key = screen.get_wch()
+            if key in ("\x1b", "q", "Q"):
+                return
+            if key in (curses.KEY_UP, "k"):
+                selected_id = THEMES[max(0, selected - 1)].identifier
+                continue
+            if key in (curses.KEY_DOWN, "j"):
+                selected_id = THEMES[min(len(THEMES) - 1, selected + 1)].identifier
+                continue
+            if key in ("\n", "\r"):
+                selected_theme = THEME_BY_ID[selected_id]
+                self.data["settings"]["theme"] = selected_theme.identifier
+                self.store.save(self.data)
+                self.initialize_theme(screen)
+                self.status = "Theme set to {}.".format(selected_theme.label)
+                return
 
     def open_command_palette(self, screen: "curses._CursesWindow") -> Optional[str]:
         query = ""
@@ -1385,17 +1536,17 @@ class Tui:
         try:
             curses.start_color()
             curses.use_default_colors()
+            theme = self.theme
             # Paint a predictable dark canvas instead of inheriting an arbitrary
             # terminal profile background (some macOS profiles default to blue).
-            curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
-            curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)
-            curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_BLACK)
-            curses.init_pair(4, curses.COLOR_GREEN, curses.COLOR_BLACK)
-            curses.init_pair(5, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-            curses.init_pair(6, curses.COLOR_RED, curses.COLOR_BLACK)
-            curses.init_pair(7, curses.COLOR_BLUE, curses.COLOR_BLACK)
-            curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_CYAN)
-            curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_BLACK)
+            curses.init_pair(1, theme.header, curses.COLOR_BLACK)
+            curses.init_pair(2, theme.accent, curses.COLOR_BLACK)
+            curses.init_pair(3, theme.text, curses.COLOR_BLACK)
+            curses.init_pair(4, theme.user, curses.COLOR_BLACK)
+            curses.init_pair(5, theme.warning, curses.COLOR_BLACK)
+            curses.init_pair(6, theme.error, curses.COLOR_BLACK)
+            curses.init_pair(8, theme.selected_text, theme.selected_background)
+            curses.init_pair(9, theme.text, curses.COLOR_BLACK)
             self.colors = {
                 "base": curses.color_pair(9),
                 "header": curses.color_pair(1),
