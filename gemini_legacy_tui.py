@@ -1365,10 +1365,34 @@ class Tui:
         self.draw_chat(screen)
         try:
             self.available_models = set(GoogleApiClient(self.api_key).list_models())
-            count = sum(1 for model in MODEL_CATALOG if model.identifier in self.available_models)
-            self.status = "{} catalog model(s) are listed for this key. F2 shows details.".format(count)
+            report = self.availability_report()
+            self.status = report[0]
+            self.show_message(screen, "Model availability", report)
         except ApiError as error:
             self.status = str(error)
+            self.show_message(
+                screen,
+                "Model availability",
+                ["The availability check could not complete.", "", str(error)],
+            )
+
+    def availability_report(self) -> List[str]:
+        available = self.available_models or set()
+        listed = [model for model in MODEL_CATALOG if model.identifier in available]
+        unavailable = [model for model in MODEL_CATALOG if model.identifier not in available]
+        lines = [
+            "{} of {} configured model(s) are listed for this API key.".format(len(listed), len(MODEL_CATALOG)),
+            "",
+        ]
+        if listed:
+            lines.append("Listed by Google:")
+            lines.extend("  {} ({})".format(model.label, model.identifier) for model in listed)
+        else:
+            lines.append("None of this app's configured models were listed by Google.")
+        if unavailable:
+            lines.extend(["", "Not listed for this key:"])
+            lines.extend("  {} ({})".format(model.label, model.identifier) for model in unavailable)
+        return lines
 
     def edit_system_instruction(self, screen: "curses._CursesWindow") -> None:
         value = self.prompt_dialog(

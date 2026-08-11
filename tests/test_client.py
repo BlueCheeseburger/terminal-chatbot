@@ -85,6 +85,15 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(tui.theme.identifier, "matrix")
         self.assertEqual(SessionStore.normalize({"settings": {"theme": "unknown"}})["settings"]["theme"], DEFAULT_THEME_ID)
 
+    def test_availability_report_keeps_the_result_visible_and_names_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+        tui.available_models = {"gemini-2.5-flash"}
+        report = tui.availability_report()
+        self.assertEqual(report[0], "1 of {} configured model(s) are listed for this API key.".format(len(MODEL_CATALOG)))
+        self.assertIn("  Gemini 2.5 Flash (gemini-2.5-flash)", report)
+        self.assertIn("Not listed for this key:", report)
+
     @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open")
     def test_gemini_uses_generate_content_schema(self, mocked_open):
         mocked_open.return_value = FakeResponse(
