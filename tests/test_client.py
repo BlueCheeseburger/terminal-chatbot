@@ -73,6 +73,8 @@ class ClientTests(unittest.TestCase):
     def test_theme_catalog_includes_matrix_green_and_default_theme(self):
         self.assertIn("matrix", THEME_BY_ID)
         self.assertEqual(THEME_BY_ID["matrix"].label, "Matrix Green")
+        self.assertEqual(THEME_BY_ID["matrix"].background, curses.COLOR_BLACK)
+        self.assertEqual(THEME_BY_ID["arctic"].background, curses.COLOR_BLUE)
         self.assertEqual([theme.identifier for theme in THEMES][0], DEFAULT_THEME_ID)
 
     def test_session_theme_selection_persists_and_invalid_values_fall_back(self):

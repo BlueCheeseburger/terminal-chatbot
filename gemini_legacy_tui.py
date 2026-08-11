@@ -60,6 +60,7 @@ class ThemeSpec:
     identifier: str
     label: str
     description: str
+    background: int
     header: int
     accent: int
     text: int
@@ -75,6 +76,7 @@ THEMES: Sequence[ThemeSpec] = (
         "midnight",
         "Midnight Cyan",
         "Cyan signals on a calm black canvas",
+        curses.COLOR_BLACK,
         curses.COLOR_CYAN,
         curses.COLOR_CYAN,
         curses.COLOR_WHITE,
@@ -88,6 +90,7 @@ THEMES: Sequence[ThemeSpec] = (
         "matrix",
         "Matrix Green",
         "Green phosphor text on pure black",
+        curses.COLOR_BLACK,
         curses.COLOR_GREEN,
         curses.COLOR_GREEN,
         curses.COLOR_GREEN,
@@ -101,6 +104,7 @@ THEMES: Sequence[ThemeSpec] = (
         "amber",
         "Amber CRT",
         "Warm amber prompts with a crisp monochrome body",
+        curses.COLOR_BLACK,
         curses.COLOR_YELLOW,
         curses.COLOR_YELLOW,
         curses.COLOR_WHITE,
@@ -113,20 +117,22 @@ THEMES: Sequence[ThemeSpec] = (
     ThemeSpec(
         "arctic",
         "Arctic Blue",
-        "Cool blue structure with cyan conversation markers",
+        "Cool blue canvas with high-contrast cyan conversation markers",
+        curses.COLOR_BLUE,
         curses.COLOR_BLUE,
         curses.COLOR_CYAN,
         curses.COLOR_WHITE,
         curses.COLOR_CYAN,
         curses.COLOR_YELLOW,
         curses.COLOR_RED,
-        curses.COLOR_WHITE,
-        curses.COLOR_BLUE,
+        curses.COLOR_BLACK,
+        curses.COLOR_CYAN,
     ),
     ThemeSpec(
         "neon",
         "Neon Noir",
         "Magenta headers and cyan responses on black",
+        curses.COLOR_BLACK,
         curses.COLOR_MAGENTA,
         curses.COLOR_CYAN,
         curses.COLOR_WHITE,
@@ -1161,7 +1167,8 @@ class Tui:
         self.show_cursor()
 
     def select_theme(self, screen: "curses._CursesWindow") -> None:
-        selected_id = self.theme.identifier
+        original_theme_id = self.theme.identifier
+        selected_id = original_theme_id
         try:
             curses.curs_set(0)
         except curses.error:
@@ -1188,26 +1195,36 @@ class Tui:
                 if row + 1 < height - 1:
                     self.add(screen, row + 1, 5, theme.description[: width - 7], self.style("muted"))
                 if row + 2 < height - 1:
-                    preview = "YOU  sample prompt     GEMINI  sample response"
-                    self.add(screen, row + 2, 5, preview[: width - 7], self.style("accent"))
+                    self.add(screen, row + 2, 5, "YOU", self.style("user", curses.A_BOLD))
+                    self.add(screen, row + 2, 10, "sample prompt", self.style("text"))
+                    self.add(screen, row + 2, 28, "GEMINI", self.style("assistant", curses.A_BOLD))
+                    self.add(screen, row + 2, 36, "sample response", self.style("text"))
             self.add(screen, height - 1, 2, "Up/Down select   Enter apply   Esc close", self.style("footer"))
             screen.refresh()
             key = screen.get_wch()
             if self.is_cancel_key(key) or key in ("q", "Q"):
+                if self.data["settings"]["theme"] != original_theme_id:
+                    self.data["settings"]["theme"] = original_theme_id
+                    self.initialize_theme(screen)
                 return
             if key in (curses.KEY_UP, "k"):
                 selected_id = THEMES[max(0, selected - 1)].identifier
+                self.preview_theme(screen, selected_id)
                 continue
             if key in (curses.KEY_DOWN, "j"):
                 selected_id = THEMES[min(len(THEMES) - 1, selected + 1)].identifier
+                self.preview_theme(screen, selected_id)
                 continue
             if key in ("\n", "\r"):
                 selected_theme = THEME_BY_ID[selected_id]
-                self.data["settings"]["theme"] = selected_theme.identifier
+                self.preview_theme(screen, selected_theme.identifier)
                 self.store.save(self.data)
-                self.initialize_theme(screen)
                 self.status = "Theme set to {}.".format(selected_theme.label)
                 return
+
+    def preview_theme(self, screen: "curses._CursesWindow", identifier: str) -> None:
+        self.data["settings"]["theme"] = identifier
+        self.initialize_theme(screen)
 
     def open_command_palette(self, screen: "curses._CursesWindow") -> Optional[str]:
         query = ""
@@ -1571,16 +1588,14 @@ class Tui:
             curses.start_color()
             curses.use_default_colors()
             theme = self.theme
-            # Paint a predictable dark canvas instead of inheriting an arbitrary
-            # terminal profile background (some macOS profiles default to blue).
-            curses.init_pair(1, theme.header, curses.COLOR_BLACK)
-            curses.init_pair(2, theme.accent, curses.COLOR_BLACK)
-            curses.init_pair(3, theme.text, curses.COLOR_BLACK)
-            curses.init_pair(4, theme.user, curses.COLOR_BLACK)
-            curses.init_pair(5, theme.warning, curses.COLOR_BLACK)
-            curses.init_pair(6, theme.error, curses.COLOR_BLACK)
+            curses.init_pair(1, theme.header, theme.background)
+            curses.init_pair(2, theme.accent, theme.background)
+            curses.init_pair(3, theme.text, theme.background)
+            curses.init_pair(4, theme.user, theme.background)
+            curses.init_pair(5, theme.warning, theme.background)
+            curses.init_pair(6, theme.error, theme.background)
             curses.init_pair(8, theme.selected_text, theme.selected_background)
-            curses.init_pair(9, theme.text, curses.COLOR_BLACK)
+            curses.init_pair(9, theme.text, theme.background)
             self.colors = {
                 "base": curses.color_pair(9),
                 "header": curses.color_pair(1),
