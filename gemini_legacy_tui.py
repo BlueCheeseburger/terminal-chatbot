@@ -751,9 +751,9 @@ class Tui:
         self.add(screen, height - 3, 0, "-" * max(width - 1, 0), self.style("border"))
         self.add(screen, height - 2, 1, ">", self.style("accent", curses.A_BOLD))
         if self.scroll_offset:
-            footer = "F6 Transcript   PgUp/Ctrl+U Scroll   {} lines above latest".format(self.scroll_offset)
+            footer = "Up/Down/PgUp Scroll   Ctrl+P/Ctrl+O Prompts   {} lines above latest".format(self.scroll_offset)
         else:
-            footer = "Tab Menu   / Commands   F6 Transcript   PgUp/Ctrl+U Scroll"
+            footer = "Tab Menu   / Commands   F6 Transcript   Up/Down/PgUp Scroll"
         self.add(screen, height - 1, 1, footer[: width - 2], self.style("footer"))
         screen.refresh()
 
@@ -838,6 +838,14 @@ class Tui:
             if key in (curses.KEY_F6, "\x14"):
                 self.show_transcript(screen)
                 return None
+            if key == curses.KEY_UP:
+                self.scroll_offset += 1
+                self.draw_chat(screen)
+                continue
+            if key == curses.KEY_DOWN:
+                self.scroll_offset = max(0, self.scroll_offset - 1)
+                self.draw_chat(screen)
+                continue
             if key in (curses.KEY_BACKSPACE, "\b", "\x7f"):
                 if cursor:
                     del buffer[cursor - 1]
@@ -849,14 +857,14 @@ class Tui:
             if key == curses.KEY_RIGHT:
                 cursor = min(len(buffer), cursor + 1)
                 continue
-            if key == curses.KEY_UP and self.prompt_history:
+            if key == "\x10" and self.prompt_history:
                 if history_index == len(self.prompt_history):
                     draft = list(buffer)
                 history_index = max(0, history_index - 1)
                 buffer = list(self.prompt_history[history_index])
                 cursor = len(buffer)
                 continue
-            if key == curses.KEY_DOWN and history_index < len(self.prompt_history):
+            if key == "\x0f" and history_index < len(self.prompt_history):
                 history_index += 1
                 buffer = list(draft if history_index == len(self.prompt_history) else self.prompt_history[history_index])
                 cursor = len(buffer)
@@ -1484,7 +1492,7 @@ class Tui:
             "Help",
             [
                 "Tab opens the main menu. Type / for the searchable command palette.",
-                "Page Up/Page Down or Ctrl+U/Ctrl+D scroll the chat. Up and Down recall submitted prompts.",
+                "Up/Down or Page Up/Page Down scroll the chat. Ctrl+P/Ctrl+O recall submitted prompts.",
                 "F6 or /transcript opens the complete conversation reader with Up/Down scrolling.",
                 "Settings contains streaming, custom model ID, system instruction, API key, and model availability.",
                 "/clear erases context; /retry repeats a failed prompt; /restart reopens the UI.",

@@ -62,6 +62,29 @@ class FakeStreamResponse:
         return False
 
 
+class FakeScreen:
+    def __init__(self, keys):
+        self.keys = iter(keys)
+
+    def getmaxyx(self):
+        return (24, 80)
+
+    def addstr(self, *_args):
+        pass
+
+    def erase(self):
+        pass
+
+    def move(self, *_args):
+        pass
+
+    def refresh(self):
+        pass
+
+    def get_wch(self):
+        return next(self.keys)
+
+
 class ClientTests(unittest.TestCase):
     def test_catalog_has_only_the_requested_palm_chat_model(self):
         palm = [model.identifier for model in MODEL_CATALOG if model.protocol == "palm"]
@@ -396,6 +419,18 @@ class ClientTests(unittest.TestCase):
             tui.remember_prompt("hello")
             tui.remember_prompt("different")
         self.assertEqual(tui.prompt_history, ["hello", "different"])
+
+    def test_up_arrow_scrolls_chat_and_ctrl_p_recalls_a_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+            tui.data["history"] = [
+                {"role": "user", "content": "line {}".format(index)} for index in range(30)
+            ]
+            tui.prompt_history = ["earlier prompt"]
+            tui.read_line(FakeScreen([curses.KEY_UP, "\x03"]), "You > ")
+            self.assertGreater(tui.scroll_offset, 0)
+            recalled = tui.read_line(FakeScreen(["\x10", "\n"]), "You > ")
+        self.assertEqual(recalled, "earlier prompt")
 
     def test_retry_reuses_the_last_failed_prompt(self):
         with tempfile.TemporaryDirectory() as directory:
