@@ -52,6 +52,7 @@ The app saves its transcript, chosen model, and system instruction in `./.gemini
 | `Tab` | Main menu |
 | `/` | Searchable slash-command menu |
 | `Page Up` / `Page Down` or `Ctrl+U` / `Ctrl+D` | Scroll through the reflowed transcript |
+| `F6` | Open the complete transcript reader |
 | `Up` / `Down` | Recall previously submitted prompts |
 | `/model` | Searchable model picker |
 | `/settings` | Streaming toggle, theme picker, system instruction, API key, and availability check |

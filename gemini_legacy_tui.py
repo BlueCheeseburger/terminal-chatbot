@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -158,10 +159,10 @@ MODEL_CATALOG: Sequence[ModelSpec] = (
 MODEL_BY_ID = {model.identifier: model for model in MODEL_CATALOG}
 DEFAULT_MODEL_ID = "gemini-2.5-flash"
 DEFAULT_SYSTEM_INSTRUCTION = (
-    "You are replying inside a terminal chat interface. Use plain text only and do not use "
-    "Markdown emphasis or other visual styling, including bold, italics, headings, block quotes, "
-    "tables, or decorative separators. Blank lines between distinct blocks are allowed when they "
-    "make the response easier to read."
+    "You are replying inside a terminal chat interface. Use plain text only. Never use Markdown "
+    "emphasis or styling markers such as asterisks, underscores, backticks, heading hashes, block "
+    "quote markers, pipe tables, or decorative separators. Do not attempt emphasis in any form. "
+    "Blank lines between distinct blocks are allowed when they make the response easier to read."
 )
 SLASH_COMMANDS: Sequence[Tuple[str, str]] = (
     ("/clear", "Clear the shared conversation context"),
@@ -599,6 +600,9 @@ class Tui:
         self.data["settings"].setdefault("streaming", True)
         self.data["settings"].setdefault("system_instruction_configured", False)
         self.data["settings"].setdefault("theme", DEFAULT_THEME_ID)
+        for item in self.data["history"]:
+            if item["role"] == "model":
+                item["content"] = self.plain_terminal_response(item["content"])
         self.status = "Ready"
         self.available_models: Optional[set] = None
         self.running = True
@@ -741,9 +745,9 @@ class Tui:
         self.add(screen, height - 3, 0, "-" * max(width - 1, 0), self.style("border"))
         self.add(screen, height - 2, 1, ">", self.style("accent", curses.A_BOLD))
         if self.scroll_offset:
-            footer = "PgUp/Ctrl+U Scroll   {} lines above latest".format(self.scroll_offset)
+            footer = "F6 Transcript   PgUp/Ctrl+U Scroll   {} lines above latest".format(self.scroll_offset)
         else:
-            footer = "Tab Menu   / Commands   PgUp/Ctrl+U Scroll   Up Recall"
+            footer = "Tab Menu   / Commands   F6 Transcript   PgUp/Ctrl+U Scroll"
         self.add(screen, height - 1, 1, footer[: width - 2], self.style("footer"))
         screen.refresh()
 
@@ -825,6 +829,9 @@ class Tui:
             if key == curses.KEY_F5:
                 self.check_availability(screen)
                 return None
+            if key in (curses.KEY_F6, "\x14"):
+                self.show_transcript(screen)
+                return None
             if key in (curses.KEY_BACKSPACE, "\b", "\x7f"):
                 if cursor:
                     del buffer[cursor - 1]
@@ -891,7 +898,7 @@ class Tui:
                 self.draw_chat(screen)
 
                 def append_chunk(chunk: str) -> None:
-                    fragments = self.display_fragments(chunk)
+                    fragments = self.display_fragments(self.plain_terminal_response(chunk))
                     for fragment in fragments:
                         reply["content"] += fragment
                         self.status = "Streaming {}... {} chars".format(selected_model.identifier, len(reply["content"]))
@@ -905,13 +912,19 @@ class Tui:
                 answer = GoogleApiClient(self.api_key).generate_stream(
                     selected_model, self.data["history"][:-1], self.data.get("system_instruction", ""), append_chunk
                 )
-                reply["content"] = answer
+                reply["content"] = self.plain_terminal_response(answer)
             else:
                 self.draw_chat(screen)
                 answer = GoogleApiClient(self.api_key).generate(
                     selected_model, self.data["history"], self.data.get("system_instruction", "")
                 )
-                self.data["history"].append({"role": "model", "content": answer, "model_id": selected_model.identifier})
+                self.data["history"].append(
+                    {
+                        "role": "model",
+                        "content": self.plain_terminal_response(answer),
+                        "model_id": selected_model.identifier,
+                    }
+                )
             self.status = "Response complete."
             self.last_failed_prompt = None
         except ApiError as error:
@@ -1019,7 +1032,7 @@ class Tui:
             self.add(screen, height - 1, 2, "Up/Down select   Enter open   Esc close", self.style("footer"))
             screen.refresh()
             key = screen.get_wch()
-            if key in ("\x1b", "\t", "q", "Q"):
+            if self.is_cancel_key(key) or key in ("\t", "q", "Q"):
                 break
             if key in (curses.KEY_UP, "k"):
                 selected = max(0, selected - 1)
@@ -1104,7 +1117,7 @@ class Tui:
             self.add(screen, height - 1, 2, "Up/Down select   Enter open   Space toggle   Esc close", self.style("footer"))
             screen.refresh()
             key = screen.get_wch()
-            if key in ("\x1b", "q", "Q"):
+            if self.is_cancel_key(key) or key in ("q", "Q"):
                 break
             if key in (curses.KEY_UP, "k"):
                 selected = max(0, selected - 1)
@@ -1180,7 +1193,7 @@ class Tui:
             self.add(screen, height - 1, 2, "Up/Down select   Enter apply   Esc close", self.style("footer"))
             screen.refresh()
             key = screen.get_wch()
-            if key in ("\x1b", "q", "Q"):
+            if self.is_cancel_key(key) or key in ("q", "Q"):
                 return
             if key in (curses.KEY_UP, "k"):
                 selected_id = THEMES[max(0, selected - 1)].identifier
@@ -1239,7 +1252,7 @@ class Tui:
             self.add(screen, height - 1, 2, footer[: width - 4], self.style("footer"))
             screen.refresh()
             key = screen.get_wch()
-            if key == "\x1b":
+            if self.is_cancel_key(key):
                 self.show_cursor()
                 return None
             if key == curses.KEY_UP and matches:
@@ -1308,7 +1321,7 @@ class Tui:
                 else:
                     self.status = "Selected {}. Shared context is retained; Ctrl+N clears it.".format(self.model.label)
                 return
-            if key in ("\x1b", "q", "Q"):
+            if self.is_cancel_key(key) or key in ("q", "Q"):
                 return
             if key in (curses.KEY_UP, "k"):
                 if matches:
@@ -1405,7 +1418,7 @@ class Tui:
             key = window.get_wch()
             if key in ("\n", "\r"):
                 return "".join(buffer).strip()
-            if key == "\x1b":
+            if self.is_cancel_key(key):
                 return None
             if key in (curses.KEY_BACKSPACE, "\b", "\x7f") and cursor:
                 del buffer[cursor - 1]
@@ -1431,7 +1444,7 @@ class Tui:
             [
                 "Tab opens the main menu. Type / for the searchable command palette.",
                 "Page Up/Page Down or Ctrl+U/Ctrl+D scroll the chat. Up and Down recall submitted prompts.",
-                "/transcript opens the complete conversation reader with Up/Down scrolling.",
+                "F6 or /transcript opens the complete conversation reader with Up/Down scrolling.",
                 "Settings contains streaming, custom model ID, system instruction, API key, and model availability.",
                 "/clear erases context; /retry repeats a failed prompt; /restart reopens the UI.",
                 "API keys are never written to disk. Transcripts live in the selected state folder.",
@@ -1470,7 +1483,7 @@ class Tui:
             self.add(screen, height - 1, 1, footer[: width - 2], self.style("footer"))
             screen.refresh()
             key = screen.get_wch()
-            if key in ("\x1b", "\n", "\r", "q", "Q"):
+            if self.is_cancel_key(key) or key in ("\n", "\r", "q", "Q"):
                 return
             if key == curses.KEY_RESIZE:
                 continue
@@ -1508,6 +1521,27 @@ class Tui:
             else:
                 cleaned.append(character)
         return "".join(cleaned)
+
+    @staticmethod
+    def plain_terminal_response(content: str) -> str:
+        """Keep assistant output readable in a terminal even when Markdown slips through."""
+        cleaned_lines: List[str] = []
+        for line in content.splitlines():
+            line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
+            line = re.sub(r"^\s{0,3}>\s?", "", line)
+            if re.fullmatch(r"\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*", line):
+                continue
+            line = re.sub(r"`([^`]*)`", r"\1", line)
+            line = line.replace("`", "")
+            line = line.replace("**", "").replace("__", "")
+            line = re.sub(r"\*([^*\n]+)\*", r"\1", line)
+            line = re.sub(r"_([^_\n]+)_", r"\1", line)
+            cleaned_lines.append(line.replace("*", "").replace("|", "  "))
+        return "\n".join(cleaned_lines)
+
+    @staticmethod
+    def is_cancel_key(key: object) -> bool:
+        return key in ("\x1b", 27, curses.KEY_EXIT)
 
     @staticmethod
     def display_fragments(chunk: str, width: int = 1) -> List[str]:

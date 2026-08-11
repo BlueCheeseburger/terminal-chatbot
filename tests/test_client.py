@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 import urllib.error
+import curses
 from pathlib import Path
 from unittest.mock import patch
 
@@ -238,6 +239,14 @@ class ClientTests(unittest.TestCase):
     def test_normal_stream_chunks_render_character_by_character(self):
         self.assertEqual(Tui.display_fragments("stream"), ["s", "t", "r", "e", "a", "m"])
 
+    def test_terminal_response_removes_markdown_styling(self):
+        response = Tui.plain_terminal_response("# Title\n\n**Bold** and *italic* with `code`.\n\n> note")
+        self.assertEqual(response, "Title\n\nBold and italic with code.\n\nnote")
+
+    def test_escape_and_curses_exit_close_menus(self):
+        self.assertTrue(Tui.is_cancel_key("\x1b"))
+        self.assertTrue(Tui.is_cancel_key(curses.KEY_EXIT))
+
     def test_stream_chunk_repaint_count_is_bounded(self):
         fragments = Tui.display_fragments("x" * 10000)
         self.assertLessEqual(len(fragments), MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK)
@@ -358,6 +367,13 @@ class ClientTests(unittest.TestCase):
             tui.transcript_lines(),
             ["YOU", "first line", "second line", "", "GEMINI-2.5-FLASH", "reply", ""],
         )
+
+    def test_existing_assistant_messages_are_normalized_for_terminal_display(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.save({"history": [{"role": "model", "content": "**Old bold reply**"}]})
+            tui = Tui("", store)
+        self.assertEqual(tui.data["history"][0]["content"], "Old bold reply")
 
     def test_wrap_content_preserves_explicit_blank_lines(self):
         self.assertEqual(Tui.wrap_content("first\n\nsecond", 20), ["first", "", "second"])
