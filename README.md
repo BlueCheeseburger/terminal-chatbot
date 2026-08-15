@@ -54,7 +54,7 @@ The app saves its transcript, chosen model, and system instruction in `./.gemini
 | `Up` / `Down` or `Page Up` / `Page Down` | Scroll through the reflowed transcript |
 | `F6` | Open the complete transcript reader |
 | `Ctrl+P` / `Ctrl+O` | Recall previous / next submitted prompt |
-| `/model` | Searchable model picker |
+| `/model` | Searchable model picker, including Custom Gemini model ID |
 | `/settings` | Streaming toggle, theme picker, system instruction, API key, and availability check |
 | `/transcript` | Open the complete transcript reader with Up/Down scrolling |
 | `/clear` | Clear the shared conversation context |

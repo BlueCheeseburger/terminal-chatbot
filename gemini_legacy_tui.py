@@ -164,6 +164,13 @@ MODEL_CATALOG: Sequence[ModelSpec] = (
 
 MODEL_BY_ID = {model.identifier: model for model in MODEL_CATALOG}
 DEFAULT_MODEL_ID = "gemini-2.5-flash"
+CUSTOM_MODEL_PICKER_ENTRY = ModelSpec(
+    "__custom_gemini_model__",
+    "Custom Gemini model ID",
+    "Custom",
+    "gemini",
+    "Enter a public Gemini model ID manually",
+)
 DEFAULT_SYSTEM_INSTRUCTION = (
     "You are replying inside a terminal chat interface. Use plain text only. Never use Markdown "
     "emphasis or styling markers such as asterisks, underscores, backticks, heading hashes, block "
@@ -1082,7 +1089,6 @@ class Tui:
         settings = (
             ("Streaming", "Render Gemini output as it arrives", "stream"),
             ("Theme", "Choose the terminal color palette", "theme"),
-            ("Custom model ID", "Use a Gemini model ID not in the catalog", "custom_model"),
             ("System instruction", "Set or clear the instruction for this chat", "system"),
             ("API key", "Enter an API key for this run only", "key"),
             ("Model availability", "Check models visible to this API key", "check"),
@@ -1093,6 +1099,10 @@ class Tui:
         except curses.error:
             pass
         while True:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
             screen.erase()
             height, width = screen.getmaxyx()
             self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("base"))
@@ -1115,8 +1125,6 @@ class Tui:
                     value = "[ON]" if self.streaming_enabled else "[OFF]"
                 elif label == "Theme":
                     value = self.theme.label
-                elif label == "Custom model ID" and self.data["model"] not in MODEL_BY_ID:
-                    value = self.data["model"]
                 elif label == "System instruction":
                     value = (
                         "Custom"
@@ -1150,20 +1158,6 @@ class Tui:
                 self.status = "Streaming {}.".format("enabled" if self.streaming_enabled else "disabled")
             elif action == "theme":
                 self.select_theme(screen)
-            elif action == "custom_model":
-                value = self.prompt_dialog(
-                    screen,
-                    "Custom Gemini model ID",
-                    self.data["model"],
-                    max_length=MAX_MODEL_ID_CHARS,
-                )
-                if value:
-                    try:
-                        self.data["model"] = validate_model_id(value)
-                        self.store.save(self.data)
-                        self.status = "Selected custom model {}. Shared context is retained.".format(value)
-                    except ApiError as error:
-                        self.status = str(error)
             elif action == "system":
                 self.edit_system_instruction(screen)
             elif action == "key":
@@ -1297,14 +1291,22 @@ class Tui:
                 query += key
 
     def select_model(self, screen: "curses._CursesWindow") -> None:
-        selected_id = self.model.identifier
+        selected_id = (
+            self.model.identifier
+            if self.data["model"] in MODEL_BY_ID
+            else CUSTOM_MODEL_PICKER_ENTRY.identifier
+        )
         query = ""
         while True:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
             screen.erase()
             height, width = screen.getmaxyx()
             matches = [
                 model
-                for model in MODEL_CATALOG
+                for model in (*MODEL_CATALOG, CUSTOM_MODEL_PICKER_ENTRY)
                 if query.lower() in "{} {} {}".format(model.identifier, model.label, model.group).lower()
             ]
             if matches and selected_id not in {model.identifier for model in matches}:
@@ -1339,14 +1341,22 @@ class Tui:
             if key in ("\n", "\r"):
                 if not matches:
                     continue
-                self.data["model"] = matches[selected].identifier
+                selected_model = matches[selected]
+                if selected_model.identifier == CUSTOM_MODEL_PICKER_ENTRY.identifier:
+                    if self.select_custom_model(screen):
+                        self.show_cursor()
+                        return
+                    continue
+                self.data["model"] = selected_model.identifier
                 self.store.save(self.data)
                 if self.model.protocol == "palm":
                     self.status = "PaLM Chat-Bison 001 is retired. Select a Gemini Flash model (Ctrl+L)."
                 else:
                     self.status = "Selected {}. Shared context is retained; Ctrl+N clears it.".format(self.model.label)
+                self.show_cursor()
                 return
             if self.is_cancel_key(key) or key in ("q", "Q"):
+                self.show_cursor()
                 return
             if key in (curses.KEY_UP, "k"):
                 if matches:
@@ -1362,6 +1372,28 @@ class Tui:
                 query = ""
             elif isinstance(key, str) and key.isprintable() and key not in ("j", "k") and len(query) < 128:
                 query += key
+
+    def select_custom_model(self, screen: "curses._CursesWindow") -> bool:
+        initial = self.data["model"] if self.data["model"] not in MODEL_BY_ID else ""
+        value = self.prompt_dialog(
+            screen,
+            "Custom Gemini model ID",
+            initial,
+            max_length=MAX_MODEL_ID_CHARS,
+        )
+        if value is None:
+            return False
+        if not value:
+            self.status = "Custom model ID was not changed."
+            return False
+        try:
+            self.data["model"] = validate_model_id(value)
+            self.store.save(self.data)
+            self.status = "Selected custom model {}. Shared context is retained.".format(value)
+            return True
+        except ApiError as error:
+            self.status = str(error)
+            return False
 
     def availability_marker(self, model: ModelSpec) -> str:
         if self.available_models is None:
@@ -1449,6 +1481,10 @@ class Tui:
         window_width = min(max(50, len(title) + 8), max(width - 2, 20))
         window = curses.newwin(window_height, window_width, max((height - window_height) // 2, 0), max((width - window_width) // 2, 0))
         window.keypad(True)
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
         buffer = list(initial[:max_length])
         cursor = len(buffer)
         while True:
@@ -1494,7 +1530,7 @@ class Tui:
                 "Tab opens the main menu. Type / for the searchable command palette.",
                 "Up/Down or Page Up/Page Down scroll the chat. Ctrl+P/Ctrl+O recall submitted prompts.",
                 "F6 or /transcript opens the complete conversation reader with Up/Down scrolling.",
-                "Settings contains streaming, custom model ID, system instruction, API key, and model availability.",
+                "Settings contains streaming, themes, system instruction, API key, and model availability.",
                 "/clear erases context; /retry repeats a failed prompt; /restart reopens the UI.",
                 "API keys are never written to disk. Transcripts live in the selected state folder.",
             ],

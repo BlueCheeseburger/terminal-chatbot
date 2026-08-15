@@ -298,6 +298,14 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(tui.model.identifier, "gemini-my-custom-id")
         self.assertEqual(tui.model.protocol, "gemini")
 
+    def test_custom_model_selection_validates_and_persists_the_choice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+            with patch.object(tui, "prompt_dialog", return_value="gemini-3.7-flash"):
+                selected = tui.select_custom_model(object())
+        self.assertTrue(selected)
+        self.assertEqual(tui.data["model"], "gemini-3.7-flash")
+
     def test_session_store_repairs_invalid_fields_and_history_items(self):
         normalized = SessionStore.normalize(
             {
