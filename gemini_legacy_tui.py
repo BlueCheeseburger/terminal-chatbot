@@ -148,6 +148,7 @@ DEFAULT_THEME_ID = "midnight"
 
 
 MODEL_CATALOG: Sequence[ModelSpec] = (
+    ModelSpec("gemini-3.7-flash", "Gemini 3.7 Flash", "Main Gemini Flash", "gemini", "Available through your API key"),
     ModelSpec("gemini-3.6-flash", "Gemini 3.6 Flash", "Main Gemini Flash", "gemini", "Current stable"),
     ModelSpec("gemini-3.5-flash", "Gemini 3.5 Flash", "Main Gemini Flash", "gemini", "Current stable"),
     ModelSpec("gemini-3-flash-preview", "Gemini 3 Flash", "Main Gemini Flash", "gemini", "Preview"),

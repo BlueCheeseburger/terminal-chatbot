@@ -90,6 +90,7 @@ class ClientTests(unittest.TestCase):
         palm = [model.identifier for model in MODEL_CATALOG if model.protocol == "palm"]
         self.assertEqual(palm, ["chat-bison-001"])
         identifiers = [model.identifier for model in MODEL_CATALOG]
+        self.assertEqual(identifiers[0], "gemini-3.7-flash")
         self.assertFalse(any("lite" in model or "pro" in model or "text-bison" in model for model in identifiers))
         self.assertFalse(any("image" in model for model in identifiers))
 
