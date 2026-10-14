@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""A lightweight terminal chat client for Gemini Flash and legacy PaLM Chat."""
+"""A lightweight terminal chat client for Gemini models and legacy PaLM Chat."""
 
 import argparse
 import json
 import os
 import re
+import shlex
 import stat
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import textwrap
 import unicodedata
 import urllib.error
@@ -37,6 +41,7 @@ MAX_API_KEY_FILE_BYTES = 4 * 1024
 MAX_API_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_DIALOG_CHARS = 64 * 1024
 MAX_INPUT_CHARS = 64 * 1024
+MAX_INPUT_ROWS = 5
 MAX_MODEL_ID_CHARS = 256
 MAX_SESSION_BYTES = 8 * 1024 * 1024
 MAX_CHARACTER_STREAM_CHUNK_CHARS = 512
@@ -44,6 +49,31 @@ MAX_STREAM_DISPLAY_UPDATES_PER_CHUNK = 64
 STREAM_RENDER_DELAY_MS = 12
 MAX_STREAM_EVENT_BYTES = 1024 * 1024
 MAX_STREAM_TEXT_CHARS = 2 * 1024 * 1024
+API_BASE_URL = "https://generativelanguage.googleapis.com"
+MAX_TERMINAL_RESULTS = 10
+STOP_HINT = ">>> PRESS ESC TO STOP <<<"
+TERMINAL_WARNING_RESULTS = (8, 9)
+TOOL_TIMEOUT_SECONDS = 30
+MAX_TOOL_OUTPUT_CHARS = 8000
+TERMINAL_TOOL_NAME = "run_terminal_command"
+TERMINAL_TOOL = {
+    "functionDeclarations": [
+        {
+            "name": TERMINAL_TOOL_NAME,
+            "description": (
+                "Run a shell command on the user's computer and return its combined output and exit code. "
+                "The user approves every command before it runs. Commands must be non-interactive and finish "
+                "within {} seconds.".format(TOOL_TIMEOUT_SECONDS)
+            ),
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {"command": {"type": "STRING", "description": "The shell command to run."}},
+                "required": ["command"],
+            },
+        }
+    ]
+}
+SECRET_ENVIRONMENT_VARIABLES = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_LEGACY_TUI_RESTART_KEY")
 
 
 @dataclass(frozen=True)
@@ -53,6 +83,7 @@ class ModelSpec:
     group: str
     protocol: str  # gemini or palm
     availability_note: str
+    retired: bool = False  # shown greyed out in the picker but still selectable
 
 
 @dataclass(frozen=True)
@@ -148,19 +179,21 @@ DEFAULT_THEME_ID = "midnight"
 
 
 MODEL_CATALOG: Sequence[ModelSpec] = (
-    ModelSpec("gemini-3.7-flash", "Gemini 3.7 Flash", "Main Gemini Flash", "gemini", "Available through your API key"),
-    ModelSpec("gemini-3.6-flash", "Gemini 3.6 Flash", "Main Gemini Flash", "gemini", "Current stable"),
-    ModelSpec("gemini-3.5-flash", "Gemini 3.5 Flash", "Main Gemini Flash", "gemini", "Current stable"),
-    ModelSpec("gemini-3-flash-preview", "Gemini 3 Flash", "Main Gemini Flash", "gemini", "Preview"),
-    ModelSpec("gemini-2.5-flash", "Gemini 2.5 Flash", "Main Gemini Flash", "gemini", "Current stable"),
-    ModelSpec("gemini-flash-latest", "Gemini Flash (latest alias)", "Main Gemini Flash", "gemini", "Moving alias"),
-    ModelSpec("gemini-1.5-flash", "Gemini 1.5 Flash", "Legacy Gemini Flash", "gemini", "Legacy; shut down by Google"),
-    ModelSpec("gemini-1.5-flash-001", "Gemini 1.5 Flash 001", "Legacy Gemini Flash", "gemini", "Legacy; likely unavailable"),
-    ModelSpec("gemini-1.5-flash-002", "Gemini 1.5 Flash 002", "Legacy Gemini Flash", "gemini", "Legacy; likely unavailable"),
-    ModelSpec("gemini-2.0-flash", "Gemini 2.0 Flash", "Legacy Gemini Flash", "gemini", "Legacy; availability varies"),
-    ModelSpec("gemini-2.0-flash-001", "Gemini 2.0 Flash 001", "Legacy Gemini Flash", "gemini", "Legacy; availability varies"),
-    ModelSpec("gemini-2.0-flash-exp", "Gemini 2.0 Flash Experimental", "Legacy Gemini Flash", "gemini", "Experimental; likely unavailable"),
-    ModelSpec("chat-bison-001", "PaLM 2 Chat-Bison 001", "PaLM Chat", "palm", "Legacy; shut down by Google"),
+    ModelSpec("gemini-4-argon", "Gemini 4 Argon", "Gemini 4", "gemini", "Current stable"),
+    ModelSpec("gemini-3.8-flash", "Gemini 3.8 Flash", "Gemini Flash", "gemini", "Current stable"),
+    ModelSpec("gemini-3.7-flash", "Gemini 3.7 Flash", "Gemini Flash", "gemini", "Available through your API key"),
+    ModelSpec("gemini-3.6-flash", "Gemini 3.6 Flash", "Gemini Flash", "gemini", "Current stable"),
+    ModelSpec("gemini-3-flash-preview", "Gemini 3 Flash", "Gemini Flash", "gemini", "Preview"),
+    ModelSpec("gemini-2.5-flash", "Gemini 2.5 Flash", "Gemini Flash", "gemini", "Previously active users only"),
+    ModelSpec("gemini-flash-latest", "Gemini Flash (latest alias)", "Gemini Flash", "gemini", "Moving alias"),
+    ModelSpec("gemini-3.5-flash", "Gemini 3.5 Flash", "Unavailable", "gemini", "Not on Google's current model list; likely 404", True),
+    ModelSpec("gemini-1.5-flash", "Gemini 1.5 Flash", "Unavailable", "gemini", "Legacy; shut down by Google", True),
+    ModelSpec("gemini-1.5-flash-001", "Gemini 1.5 Flash 001", "Unavailable", "gemini", "Legacy; likely unavailable", True),
+    ModelSpec("gemini-1.5-flash-002", "Gemini 1.5 Flash 002", "Unavailable", "gemini", "Legacy; likely unavailable", True),
+    ModelSpec("gemini-2.0-flash", "Gemini 2.0 Flash", "Unavailable", "gemini", "Legacy; shut down by Google", True),
+    ModelSpec("gemini-2.0-flash-001", "Gemini 2.0 Flash 001", "Unavailable", "gemini", "Legacy; shut down by Google", True),
+    ModelSpec("gemini-2.0-flash-exp", "Gemini 2.0 Flash Experimental", "Unavailable", "gemini", "Experimental; likely unavailable", True),
+    ModelSpec("chat-bison-001", "PaLM 2 Chat-Bison 001", "Unavailable", "palm", "Legacy PaLM; shut down by Google (HTTP 501)", True),
 )
 
 MODEL_BY_ID = {model.identifier: model for model in MODEL_CATALOG}
@@ -180,18 +213,12 @@ DEFAULT_SYSTEM_INSTRUCTION = (
 )
 SLASH_COMMANDS: Sequence[Tuple[str, str]] = (
     ("/clear", "Clear the shared conversation context"),
-    ("/new", "Start a new conversation context"),
     ("/model", "Choose a model"),
-    ("/models", "Show the configured model catalog"),
-    ("/settings", "Open settings"),
-    ("/transcript", "Read the complete transcript"),
     ("/retry", "Retry the last failed prompt"),
-    ("/system", "Set the system instruction"),
+    ("/permissions", "Choose how terminal commands are approved (needs Terminal access)"),
     ("/key", "Enter an API key for this run"),
     ("/check", "Check model availability"),
     ("/restart", "Close and reopen the TUI"),
-    ("/help", "Show help and shortcuts"),
-    ("/quit", "Exit Gemini Legacy"),
 )
 
 
@@ -230,6 +257,456 @@ def validate_model_id(value: str) -> str:
     return identifier
 
 
+def model_supports_terminal_tools(identifier: str) -> bool:
+    """Terminal access is limited to gemini-flash-latest, Gemini 4 and later, and Gemini 3.8 Flash and later."""
+    if identifier == "gemini-flash-latest":
+        return True
+    if any(token in identifier for token in ("lite", "image", "tts", "live", "embedding", "transcribe")):
+        return False
+    match = re.match(r"gemini-(\d+)(?:\.(\d+))?-", identifier)
+    if not match:
+        return False
+    major, minor = int(match.group(1)), int(match.group(2) or 0)
+    if major >= 4:
+        return True
+    return (major, minor) >= (3, 8) and "flash" in identifier
+
+
+def run_shell_command(
+    command: str, timeout: int = TOOL_TIMEOUT_SECONDS, should_stop: Optional[Callable[[], bool]] = None
+) -> dict:
+    """Run one approved shell command with a timeout and bounded output; API keys are removed from its environment.
+
+    should_stop is polled while the command runs; when it returns True the command is killed."""
+    environment = {key: value for key, value in os.environ.items() if key not in SECRET_ENVIRONMENT_VARIABLES}
+    try:
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=str(Path.cwd()),
+            env=environment,
+            start_new_session=(os.name != "nt"),
+        )
+    except OSError as error:
+        return {"error": "Could not start the command: {}".format(error)}
+    kept: List[bytes] = []
+    state = {"size": 0, "truncated": False, "dropped_bytes": 0}
+
+    def drain() -> None:
+        while True:
+            chunk = process.stdout.read(65536)
+            if not chunk:
+                break
+            room = MAX_TOOL_OUTPUT_CHARS * 4 - state["size"]
+            if room > 0:
+                kept.append(chunk[:room])
+                state["size"] += min(len(chunk), room)
+            if len(chunk) > room:
+                state["truncated"] = True
+                state["dropped_bytes"] += len(chunk) - max(room, 0)
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    timed_out = False
+    stopped = False
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            process.wait(timeout=0.1)
+            break
+        except subprocess.TimeoutExpired:
+            stopped = bool(should_stop and should_stop())
+            timed_out = not stopped and time.monotonic() >= deadline
+            if stopped or timed_out:
+                try:
+                    if os.name == "nt":
+                        process.kill()
+                    else:
+                        os.killpg(process.pid, 9)
+                except OSError:
+                    pass
+                process.wait()
+                break
+    reader.join(timeout=2)
+    process.stdout.close()
+    output = b"".join(kept).decode("utf-8", errors="replace")
+    omitted = 0
+    if len(output) > MAX_TOOL_OUTPUT_CHARS:
+        omitted = len(output) - MAX_TOOL_OUTPUT_CHARS
+        output = output[:MAX_TOOL_OUTPUT_CHARS]
+        state["truncated"] = True
+    if state["truncated"]:
+        # Bytes past the read cap were discarded unread, so that part of the count is approximate.
+        omitted += state["dropped_bytes"]
+        output += "\n[truncated at {} characters; {}{} characters omitted]".format(
+            MAX_TOOL_OUTPUT_CHARS, "about " if state["dropped_bytes"] else "", omitted
+        )
+    result = {"exit_code": process.returncode, "output": output}
+    if state["truncated"]:
+        result["output_truncated"] = True
+    if timed_out:
+        result["timed_out"] = True
+    if stopped:
+        result["stopped_by_user"] = True
+    return result
+
+
+CATEGORY_ORDER = ("READ", "CREATION", "WRITE", "REMOVAL")
+SHELL_NAMES = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
+INTERPRETER_NAMES = {"python", "python3", "node", "ruby", "perl", "php", "deno", "bun", "osascript"}
+WRAPPER_NAMES = {"env", "command", "time", "nohup", "nice", "xargs", "builtin", "exec"}
+PRIVILEGE_NAMES = {"sudo", "su", "doas"}
+XARGS_VALUE_FLAGS = {"-n", "-I", "-P", "-L", "-s", "-d", "-E", "-a"}
+READ_COMMANDS = {
+    "ls", "cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "ag", "pwd", "echo", "printf", "wc", "file", "stat",
+    "du", "df", "ps", "whoami", "id", "date", "uname", "which", "whereis", "type", "env", "printenv", "sort", "uniq",
+    "diff", "cmp", "less", "more", "tree", "basename", "dirname", "realpath", "readlink", "cut", "tr", "awk", "jq",
+    "hostname", "uptime", "lsof", "top", "true", "false", "test", "[", "man", "tldr", "ping", "dig", "nslookup",
+    "sw_vers", "sysctl", "md5", "md5sum", "shasum", "sha256sum", "column", "nl", "rev", "seq", "sleep", "cd", "ifconfig",
+    "mdfind", "xxd", "hexdump", "strings",
+}
+REMOVAL_COMMANDS = {"rm", "rmdir", "unlink", "shred", "srm", "trash"}
+WRITE_COMMANDS = {
+    "mv", "chmod", "chown", "chgrp", "truncate", "patch", "dd", "rsync", "defaults", "xattr", "make", "gzip", "gunzip",
+    "kill", "pkill", "killall", "launchctl", "crontab", "diskutil", "fdisk", "shutdown", "reboot", "halt", "networksetup",
+    "systemctl", "mount", "umount", "ditto", "cmake", "gcc", "g++", "clang", "cc", "go", "rustc", "javac", "tmux", "screen",
+}
+CREATION_COMMANDS = {"mkdir", "mktemp", "ln", "zip"}
+SYSTEM_RISK_COMMANDS = {
+    "dd", "diskutil", "fdisk", "shutdown", "reboot", "halt", "launchctl", "crontab", "kill", "pkill", "killall",
+    "networksetup", "systemctl", "mount", "umount", "eval", "osascript",
+}
+PACKAGE_MANAGERS = {"pip", "pip3", "npm", "pnpm", "yarn", "brew", "cargo", "gem", "apt", "apt-get", "conda"}
+GIT_READ = {
+    "status", "log", "diff", "show", "blame", "ls-files", "ls-tree", "rev-parse", "describe", "shortlog", "grep",
+    "cat-file", "help", "version", "rev-list", "count-objects", "whatchanged",
+}
+NON_FILE_REDIRECT_TARGETS = {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"}
+
+
+@dataclass
+class CommandReview:
+    categories: List[str]  # distinct categories, least to most severe
+    risks: List[str]  # reasons the command must always be confirmed, even after "allow all"
+    notes: List[str]
+
+    @property
+    def primary(self) -> str:
+        return self.categories[-1]
+
+    @property
+    def needs_confirmation(self) -> bool:
+        """Risky commands and removals ask every time unless the user allows literally everything."""
+        return bool(self.risks) or "REMOVAL" in self.categories
+
+
+def _outside_working_directory(argument: str) -> bool:
+    if not argument or argument.startswith("-"):
+        return False
+    if argument.startswith("$") or argument.startswith("~"):
+        return True
+    path = Path(argument)
+    if not path.is_absolute() and ".." not in path.parts:
+        return False
+    try:
+        resolved = (path if path.is_absolute() else Path.cwd() / path).resolve()
+        base = Path.cwd().resolve()
+    except (OSError, RuntimeError):
+        return True
+    return resolved != base and base not in resolved.parents
+
+
+def _split_command(command: str) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """Split on shell operators outside quotes. Returns ([(operator before, segment)], redirect targets)."""
+    segments: List[Tuple[str, str]] = []
+    redirects: List[str] = []
+    current: List[str] = []
+    operator = ""
+    quote = ""
+    index = 0
+    length = len(command)
+
+    def flush(next_operator: str) -> None:
+        nonlocal operator, current
+        segments.append((operator, "".join(current)))
+        operator = next_operator
+        current = []
+
+    while index < length:
+        char = command[index]
+        if quote:
+            current.append(char)
+            if char == "\\" and quote == '"' and index + 1 < length:
+                current.append(command[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char == "\\" and index + 1 < length:
+            current.append(command[index : index + 2])
+            index += 2
+            continue
+        if char in "'\"":
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        if command[index : index + 2] in ("&&", "||"):
+            flush(command[index : index + 2])
+            index += 2
+            continue
+        if char == ">":
+            end = index + 1
+            if command[end : end + 1] == ">":
+                end += 1
+            if command[end : end + 1] == "&":
+                index = end + 1
+                continue
+            while end < length and command[end] in " \t":
+                end += 1
+            start = end
+            while end < length and command[end] not in " \t\n;|&()<>`":
+                end += 1
+            redirects.append(command[start:end].strip("'\""))
+            index = end
+            continue
+        if char in ";|\n`()":
+            flush(char)
+            index += 1
+            continue
+        if char == "&" and command[index + 1 : index + 2] != ">":
+            flush("&")
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+    flush("")
+    return segments, redirects
+
+
+def _words(segment: str) -> List[str]:
+    try:
+        return shlex.split(segment)
+    except ValueError:
+        return segment.split()
+
+
+def _review_words(words: List[str], review: "CommandReview", cats: set, depth: int) -> None:
+    index = 0
+
+    def skip_assignments() -> None:
+        nonlocal index
+        while index < len(words) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[index]):
+            index += 1
+
+    skip_assignments()
+    while index < len(words) and os.path.basename(words[index]) in WRAPPER_NAMES | PRIVILEGE_NAMES:
+        wrapper = os.path.basename(words[index])
+        if wrapper in PRIVILEGE_NAMES:
+            review.risks.append("runs with elevated privileges ({})".format(wrapper))
+        index += 1
+        while index < len(words) and words[index].startswith("-"):
+            flag = words[index]
+            index += 1
+            if wrapper == "xargs" and flag in XARGS_VALUE_FLAGS and index < len(words):
+                index += 1
+        skip_assignments()
+    if index >= len(words):
+        return
+    name = os.path.basename(words[index])
+    args = words[index + 1 :]
+    flags = [argument for argument in args if argument.startswith("-")]
+    operands = [argument for argument in args if not argument.startswith("-")]
+
+    def has_flag(*wanted: str) -> bool:
+        return any(flag in wanted for flag in flags)
+
+    def path_check() -> None:
+        if any(_outside_working_directory(operand) for operand in operands):
+            review.risks.append("touches paths outside the working directory")
+
+    if name in SYSTEM_RISK_COMMANDS or name.startswith("mkfs"):
+        review.risks.append("system-level command ({})".format(name))
+    if name in REMOVAL_COMMANDS:
+        cats.add("REMOVAL")
+        path_check()
+    elif name in SHELL_NAMES:
+        script = None
+        for position, argument in enumerate(args):
+            if re.fullmatch(r"-[A-Za-z]*c", argument) and position + 1 < len(args):
+                script = args[position + 1]
+                break
+        if script is not None:
+            _classify_into(script, review, cats, depth + 1)
+        else:
+            cats.add("WRITE")
+            review.notes.append("Runs a shell script; its effects cannot be analyzed.")
+    elif name in INTERPRETER_NAMES:
+        cats.add("WRITE")
+        review.notes.append("Runs {} code; its effects cannot be analyzed.".format(name))
+        if has_flag("-c", "-e", "-E", "-p", "-r") or name == "osascript":
+            review.risks.append("runs inline {} code".format(name))
+    elif name == "eval":
+        cats.add("WRITE")
+    elif name == "git":
+        _review_git(args, review, cats)
+    elif name in PACKAGE_MANAGERS:
+        action = operands[0] if operands else ""
+        if action in ("install", "add", "i", "ci", "update", "upgrade", "upgrade-all"):
+            cats.add("CREATION")
+            review.risks.append("installs or updates software ({} {})".format(name, action))
+        elif action in ("uninstall", "remove", "rm", "purge", "autoremove"):
+            cats.add("REMOVAL")
+        elif action in ("list", "ls", "show", "search", "info", "view", "outdated", "freeze", "--version", "help", ""):
+            cats.add("READ")
+        else:
+            cats.add("WRITE")
+    elif name == "find":
+        if "-exec" in args or "-execdir" in args or "-ok" in args:
+            position = max(args.index(token) for token in ("-exec", "-execdir", "-ok") if token in args)
+            inner = []
+            for token in args[position + 1 :]:
+                if token in (";", "+", "\\;"):
+                    break
+                inner.append(token)
+            _review_words(inner, review, cats, depth + 1)
+        if has_flag("-delete"):
+            cats.add("REMOVAL")
+        cats.add("READ")
+    elif name == "sed":
+        cats.add("WRITE" if any(flag.startswith("-i") or flag == "--in-place" for flag in flags) else "READ")
+    elif name == "curl":
+        if any(flag in ("-o", "-O", "--output", "--remote-name") or flag.startswith("--output") for flag in flags):
+            cats.add("CREATION")
+        elif any(flag in ("-d", "-F", "-T", "-X", "--upload-file", "--form") or flag.startswith("--data") for flag in flags):
+            cats.add("WRITE")
+            review.notes.append("Sends data to a remote server.")
+        else:
+            cats.add("READ")
+    elif name == "wget":
+        cats.add("READ" if any(flag in ("-O-", "-qO-") for flag in flags) else "CREATION")
+    elif name == "tar":
+        mode = "".join(flags + operands[:1])
+        cats.add("CREATION" if re.search(r"[xc]", mode) else "READ")
+    elif name == "unzip":
+        cats.add("READ" if has_flag("-l", "-t") else "CREATION")
+    elif name == "tee":
+        existing = [operand for operand in operands if Path(operand).exists()]
+        cats.add("WRITE" if existing or has_flag("-a") else "CREATION")
+        path_check()
+    elif name in ("cp", "install", "rename"):
+        destination = operands[-1] if operands else ""
+        cats.add("WRITE" if destination and Path(destination).exists() else "CREATION")
+        path_check()
+    elif name == "touch":
+        cats.add("WRITE" if operands and all(Path(operand).exists() for operand in operands) else "CREATION")
+        path_check()
+    elif name in CREATION_COMMANDS:
+        cats.add("CREATION")
+        path_check()
+    elif name in WRITE_COMMANDS:
+        cats.add("WRITE")
+        path_check()
+        if name in ("chmod", "chown", "chgrp") and (has_flag("-R", "-r") or any(re.fullmatch(r"-[A-Za-z]*R[A-Za-z]*", flag) for flag in flags)):
+            review.risks.append("recursive permission change")
+    elif name in READ_COMMANDS:
+        cats.add("READ")
+    else:
+        cats.add("WRITE")
+        review.notes.append("Unrecognized command '{}'; treated as a write.".format(name))
+
+
+def _review_git(args: List[str], review: "CommandReview", cats: set) -> None:
+    index = 0
+    while index < len(args) and args[index].startswith("-"):
+        index += 2 if args[index] in ("-C", "-c") else 1
+    action = args[index] if index < len(args) else ""
+    rest = args[index + 1 :]
+    rest_flags = [argument for argument in rest if argument.startswith("-")]
+    rest_operands = [argument for argument in rest if not argument.startswith("-")]
+    if action in GIT_READ or action == "":
+        cats.add("READ")
+    elif action in ("init", "clone"):
+        cats.add("CREATION")
+    elif action in ("rm", "clean"):
+        cats.add("REMOVAL")
+    elif action == "branch":
+        if any(flag in ("-d", "-D", "--delete") for flag in rest_flags):
+            cats.add("REMOVAL")
+        elif any(flag in ("-m", "-M", "-c", "-C") for flag in rest_flags):
+            cats.add("WRITE")
+        else:
+            cats.add("CREATION" if rest_operands else "READ")
+    elif action == "tag":
+        if any(flag in ("-d", "--delete") for flag in rest_flags):
+            cats.add("REMOVAL")
+        else:
+            cats.add("CREATION" if rest_operands else "READ")
+    elif action == "remote":
+        sub = rest_operands[0] if rest_operands else ""
+        cats.add("REMOVAL" if sub in ("remove", "rm") else "WRITE" if sub in ("add", "set-url", "rename") else "READ")
+    elif action == "stash":
+        sub = rest_operands[0] if rest_operands else ""
+        cats.add("REMOVAL" if sub in ("drop", "clear") else "READ" if sub in ("list", "show") else "WRITE")
+    elif action == "config":
+        cats.add("READ" if any(flag in ("--get", "--get-all", "--list", "-l") for flag in rest_flags) else "WRITE")
+    else:
+        cats.add("WRITE")
+    if action == "push":
+        review.risks.append("publishes changes to a remote (git push)")
+    if action == "reset" and "--hard" in rest_flags:
+        review.risks.append("discards local changes (git reset --hard)")
+    if action in ("checkout", "restore") and ("--" in rest or "." in rest_operands):
+        review.risks.append("may discard local changes (git {})".format(action))
+    if action == "clean":
+        review.risks.append("deletes untracked files (git clean)")
+
+
+def _classify_into(command: str, review: "CommandReview", cats: set, depth: int) -> None:
+    if depth > 3:
+        review.risks.append("deeply nested command that cannot be fully analyzed")
+        cats.add("WRITE")
+        return
+    segments, redirects = _split_command(command)
+    for operator, segment in segments:
+        words = _words(segment)
+        if not words:
+            continue
+        if operator == "|":
+            lead = os.path.basename(words[0])
+            if lead in SHELL_NAMES or lead == "eval":
+                review.risks.append("pipes data into a shell")
+        _review_words(words, review, cats, depth)
+    # Substitutions inside double quotes are not split above, so review them separately.
+    substitutions = re.findall(r"\$\(([^()]*)\)", command) + re.findall(r"`([^`]*)`", command)
+    for inner in substitutions:
+        _classify_into(inner, review, cats, depth + 1)
+    if command.count("$(") > len(re.findall(r"\$\(([^()]*)\)", command)):
+        review.risks.append("complex command substitution that cannot be fully analyzed")
+    for target in redirects:
+        if not target or target in NON_FILE_REDIRECT_TARGETS:
+            continue
+        cats.add("WRITE" if Path(target).expanduser().exists() else "CREATION")
+        if _outside_working_directory(target):
+            review.risks.append("writes outside the working directory ({})".format(target))
+
+
+def classify_command(command: str) -> CommandReview:
+    """Label a shell command READ, CREATION, WRITE, or REMOVAL and flag commands that must always be confirmed."""
+    review = CommandReview(categories=[], risks=[], notes=[])
+    cats: set = set()
+    _classify_into(command, review, cats, 0)
+    review.categories = [category for category in CATEGORY_ORDER if category in cats] or ["READ"]
+    review.risks = list(dict.fromkeys(review.risks))
+    review.notes = list(dict.fromkeys(review.notes))
+    return review
+
+
 def read_api_key_file(path: Path) -> str:
     with path.open("rb") as handle:
         raw = handle.read(MAX_API_KEY_FILE_BYTES + 1)
@@ -241,6 +718,29 @@ def read_api_key_file(path: Path) -> str:
 class GoogleApiClient:
     def __init__(self, api_key: str) -> None:
         self.api_key = validate_api_key(api_key)
+        self.usage_input = 0  # prompt tokens billed by the requests this client made
+        self.usage_output = 0  # response tokens, including thinking tokens
+        self.model_version = ""  # the model Google says answered (resolves aliases like gemini-flash-latest)
+
+    @staticmethod
+    def _token_counts(response: dict) -> Tuple[int, int]:
+        usage = response.get("usageMetadata")
+        if not isinstance(usage, dict):
+            return 0, 0
+
+        def count(name: str) -> int:
+            value = usage.get(name)
+            return value if isinstance(value, int) and value > 0 else 0
+
+        return count("promptTokenCount"), count("candidatesTokenCount") + count("thoughtsTokenCount")
+
+    def _note_response(self, response: dict) -> None:
+        prompt_tokens, output_tokens = self._token_counts(response)
+        self.usage_input += prompt_tokens
+        self.usage_output += output_tokens
+        version = response.get("modelVersion")
+        if isinstance(version, str) and version.strip():
+            self.model_version = version.strip()[:MAX_MODEL_ID_CHARS]
 
     def _request(self, url: str, body: Optional[dict] = None) -> dict:
         if not self.api_key:
@@ -261,6 +761,7 @@ class GoogleApiClient:
                 parsed = json.loads(raw.decode("utf-8", errors="replace"))
                 if not isinstance(parsed, dict):
                     raise ApiError("Google returned an unexpected JSON response.")
+                self._note_response(parsed)
                 return parsed
         except urllib.error.HTTPError as error:
             raise ApiError("HTTP {}: {}".format(error.code, self._http_error_message(error))) from error
@@ -305,7 +806,7 @@ class GoogleApiClient:
         return message
 
     def list_models(self) -> List[str]:
-        url = "https://generativelanguage.googleapis.com/v1beta/models"
+        url = API_BASE_URL + "/v1beta/models"
         response = self._request(url)
         models = response.get("models", [])
         if not isinstance(models, list):
@@ -348,10 +849,14 @@ class GoogleApiClient:
         return body
 
     def _generate_gemini(self, model: ModelSpec, history: Sequence[Dict[str, str]], system_instruction: str) -> str:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent".format(
+        url = (API_BASE_URL + "/v1beta/models/{}:generateContent").format(
             urllib.parse.quote(model.identifier, safe="")
         )
         response = self._request(url, self._gemini_body(history, system_instruction))
+        return self._text_from_parts(self._candidate_parts(response))
+
+    @staticmethod
+    def _candidate_parts(response: dict) -> list:
         candidates = response.get("candidates", [])
         if not isinstance(candidates, list) or not candidates:
             feedback = response.get("promptFeedback", {})
@@ -360,6 +865,10 @@ class GoogleApiClient:
         first = candidates[0] if isinstance(candidates[0], dict) else {}
         content = first.get("content", {})
         parts = content.get("parts", []) if isinstance(content, dict) else []
+        return parts if isinstance(parts, list) else []
+
+    @staticmethod
+    def _text_from_parts(parts: list) -> str:
         text = "\n".join(
             part["text"]
             for part in parts
@@ -371,6 +880,72 @@ class GoogleApiClient:
             raise ApiError("The response exceeded the safety limit.")
         return text
 
+    def generate_with_tools(
+        self,
+        model: ModelSpec,
+        history: Sequence[Dict[str, str]],
+        system_instruction: str,
+        run_command: Callable[[str], Tuple[dict, str]],
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> Tuple[str, List[str]]:
+        """Answer with the terminal tool enabled. run_command returns (tool result, log line).
+
+        At most MAX_TERMINAL_RESULTS terminal results are fed back per turn. The results numbered
+        in TERMINAL_WARNING_RESULTS (and the last one) end with a note about the accesses left."""
+        url = (API_BASE_URL + "/v1beta/models/{}:generateContent").format(
+            urllib.parse.quote(model.identifier, safe="")
+        )
+        body = self._gemini_body(history, system_instruction)
+        body["tools"] = [TERMINAL_TOOL]
+        log: List[str] = []
+        used = 0
+        while True:
+            if used >= MAX_TERMINAL_RESULTS:
+                # No accesses left: the model must answer in text.
+                body["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
+            parts = self._candidate_parts(self._request(url, body))
+            calls = [part for part in parts if isinstance(part, dict) and isinstance(part.get("functionCall"), dict)]
+            if not calls:
+                return self._text_from_parts(parts), log
+            if used >= MAX_TERMINAL_RESULTS and "toolConfig" in body:
+                raise ApiError("The model kept asking for terminal access after the {} command limit.".format(MAX_TERMINAL_RESULTS))
+            # Echo the model's parts back unchanged so signatures and call ids survive.
+            body["contents"].append({"role": "model", "parts": parts})
+            responses = []
+            for part in calls:
+                call = part["functionCall"]
+                arguments = call.get("args")
+                command = arguments.get("command") if isinstance(arguments, dict) else None
+                if used >= MAX_TERMINAL_RESULTS:
+                    result = {"error": "Terminal access limit reached for this turn. Answer with what you have."}
+                elif should_stop and should_stop():
+                    result = {"error": "The user stopped this turn."}
+                elif call.get("name") != TERMINAL_TOOL_NAME or not isinstance(command, str) or not command.strip():
+                    result = {"error": "Unknown tool or missing command argument."}
+                else:
+                    result, line = run_command(command.strip())
+                    log.append(line)
+                used += 1
+                remaining = MAX_TERMINAL_RESULTS - used
+                note = ""
+                if used in TERMINAL_WARNING_RESULTS and remaining > 0:
+                    note = "[You have {} more terminal access{} in the current turn.]".format(
+                        remaining, "" if remaining == 1 else "es"
+                    )
+                elif used == MAX_TERMINAL_RESULTS:
+                    note = "[That was your last terminal access in the current turn.]"
+                if note:
+                    key = "output" if "output" in result else "error"
+                    result = dict(result)
+                    result[key] = "{}\n{}".format(result.get(key, ""), note).lstrip("\n")
+                response = {"name": call.get("name") or TERMINAL_TOOL_NAME, "response": result}
+                if isinstance(call.get("id"), str):
+                    response["id"] = call["id"]
+                responses.append({"functionResponse": response})
+            body["contents"].append({"role": "user", "parts": responses})
+            if should_stop and should_stop():
+                return "Stopped by you before the model finished.", log
+
     def _stream_gemini(
         self,
         model: ModelSpec,
@@ -380,7 +955,7 @@ class GoogleApiClient:
     ) -> str:
         if not self.api_key:
             raise ApiError("No API key. Set GEMINI_API_KEY or press F4 to enter one.")
-        url = "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse".format(
+        url = (API_BASE_URL + "/v1beta/models/{}:streamGenerateContent?alt=sse").format(
             urllib.parse.quote(model.identifier, safe="")
         )
         headers = {
@@ -395,6 +970,7 @@ class GoogleApiClient:
         request = urllib.request.Request(url, data=request_data, headers=headers, method="POST")
         received: List[str] = []
         received_chars = 0
+        latest_usage = (0, 0)  # streamed events carry running totals, so keep only the latest
         try:
             with GOOGLE_API_OPENER.open(request, timeout=90) as response:
                 while True:
@@ -412,6 +988,12 @@ class GoogleApiClient:
                         raise ApiError("Google returned an invalid streaming event.") from error
                     if not isinstance(event, dict):
                         raise ApiError("Google returned an unexpected streaming event.")
+                    counts = self._token_counts(event)
+                    if counts != (0, 0):
+                        latest_usage = counts
+                    version = event.get("modelVersion")
+                    if isinstance(version, str) and version.strip():
+                        self.model_version = version.strip()[:MAX_MODEL_ID_CHARS]
                     candidates = event.get("candidates", [])
                     if not isinstance(candidates, list) or not candidates:
                         continue
@@ -437,6 +1019,8 @@ class GoogleApiClient:
             raise ApiError("Request timed out. Check the network connection and try again.") from error
         except OSError as error:
             raise ApiError("Network error: {}".format(error)) from error
+        self.usage_input += latest_usage[0]
+        self.usage_output += latest_usage[1]
         text = "".join(received).strip()
         if not text:
             raise ApiError("The selected model returned no text.")
@@ -445,7 +1029,7 @@ class GoogleApiClient:
     def _generate_palm(self, model: ModelSpec, history: Sequence[Dict[str, str]], system_instruction: str) -> str:
         # PaLM Chat used a different, now-retired API shape. Keeping this request
         # lets accounts with an available legacy endpoint attempt the original model.
-        url = "https://generativelanguage.googleapis.com/v1beta3/models/{}:generateMessage".format(
+        url = (API_BASE_URL + "/v1beta3/models/{}:generateMessage").format(
             urllib.parse.quote(model.identifier, safe="")
         )
         messages = [
@@ -539,8 +1123,16 @@ class SessionStore:
                 if role == "model" and isinstance(model_id, str) and model_id:
                     normalized["model_id"] = model_id
                 history.append(normalized)
+        raw_usage = data.get("usage")
+        usage = {"input": 0, "output": 0}
+        if isinstance(raw_usage, dict):
+            for name in usage:
+                value = raw_usage.get(name)
+                if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 10**12:
+                    usage[name] = value
         settings = data.get("settings", {})
         streaming = settings.get("streaming", True) if isinstance(settings, dict) else True
+        terminal_tools = settings.get("terminal_tools", False) if isinstance(settings, dict) else False
         theme = settings.get("theme", DEFAULT_THEME_ID) if isinstance(settings, dict) else DEFAULT_THEME_ID
         if not isinstance(theme, str) or theme not in THEME_BY_ID:
             theme = DEFAULT_THEME_ID
@@ -558,8 +1150,10 @@ class SessionStore:
             "model": model,
             "system_instruction": system_instruction,
             "history": history,
+            "usage": usage,
             "settings": {
                 "streaming": streaming if isinstance(streaming, bool) else True,
+                "terminal_tools": terminal_tools if isinstance(terminal_tools, bool) else False,
                 "system_instruction_configured": system_instruction_configured,
                 "theme": theme,
             },
@@ -611,13 +1205,16 @@ class Tui:
             self.data["model"] = DEFAULT_MODEL_ID
         if not isinstance(self.data.get("settings"), dict):
             self.data["settings"] = {}
+        self.data.setdefault("usage", {"input": 0, "output": 0})
         self.data["settings"].setdefault("streaming", True)
+        self.data["settings"].setdefault("terminal_tools", False)
         self.data["settings"].setdefault("system_instruction_configured", False)
         self.data["settings"].setdefault("theme", DEFAULT_THEME_ID)
         for item in self.data["history"]:
             if item["role"] == "model":
                 item["content"] = self.plain_terminal_response(item["content"])
-        self.status = "Ready"
+        self.status = "Ready" if self.api_key else "No API key. Press F4 or open Settings from the Tab menu to enter one."
+        self.input_rows = 1
         self.available_models: Optional[set] = None
         self.running = True
         self.restart_requested = False
@@ -627,6 +1224,8 @@ class Tui:
             item["content"] for item in self.data["history"] if item["role"] == "user"
         ]
         self.last_failed_prompt: Optional[str] = None
+        self.command_permissions = "ask"  # ask, safe, or all; resets on restart
+        self.stop_requested = False
 
     @property
     def model(self) -> ModelSpec:
@@ -639,6 +1238,18 @@ class Tui:
     @property
     def streaming_enabled(self) -> bool:
         return bool(self.data["settings"].get("streaming", True))
+
+    @property
+    def terminal_tools_setting(self) -> bool:
+        return bool(self.data["settings"].get("terminal_tools", False))
+
+    @property
+    def terminal_tools_active(self) -> bool:
+        return (
+            self.terminal_tools_setting
+            and self.model.protocol == "gemini"
+            and model_supports_terminal_tools(self.model.identifier)
+        )
 
     @property
     def theme(self) -> ThemeSpec:
@@ -709,12 +1320,41 @@ class Tui:
             pass
         screen.keypad(True)
         screen.timeout(-1)
+        curses.nonl()  # Enter arrives as "\r" and Ctrl+J as "\n", so Shift+Enter can mean a new line
         while self.running:
+            self.input_rows = 1
             self.draw_chat(screen)
             prompt = self.read_line(screen, "You > ")
+            self.input_rows = 1
             if prompt is None:
                 continue
             self.handle_input(screen, prompt)
+
+    @staticmethod
+    def format_tokens(value: int) -> str:
+        return "{:,}".format(value)
+
+    def header_parts(self) -> Tuple[str, str]:
+        """The one-line header: (model id, the rest)."""
+        turns = sum(1 for item in self.data["history"] if item["role"] == "user")
+        usage = self.data["usage"]
+        rest = "   {} turn{}   {} in / {} out tokens".format(
+            turns,
+            "" if turns == 1 else "s",
+            self.format_tokens(usage["input"]),
+            self.format_tokens(usage["output"]),
+        )
+        return self.model.identifier, rest
+
+    def draw_header(self, screen: "curses._CursesWindow", width: int, compact: bool = False) -> None:
+        model_id, rest = self.header_parts()
+        if compact:
+            self.add(screen, 0, 0, " " * max(width - 1, 0), curses.A_REVERSE)
+            self.add(screen, 0, 0, (" " + model_id + rest)[: max(width - 1, 0)], curses.A_REVERSE)
+            return
+        self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("base"))
+        self.add(screen, 0, 1, model_id[: max(width - 2, 0)], self.style("accent", curses.A_BOLD))
+        self.add(screen, 0, 1 + len(model_id), rest[: max(width - len(model_id) - 2, 0)], self.style("muted"))
 
     def draw_chat(self, screen: "curses._CursesWindow") -> None:
         screen.erase()
@@ -723,58 +1363,41 @@ class Tui:
             self.draw_compact_chat(screen)
             return
 
-        self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("base"))
-        self.add(screen, 0, 1, "[ GEMINI LEGACY ]", self.style("header", curses.A_BOLD))
-        self.add(screen, 0, 20, "CHAT", self.style("header_muted"))
-        if self.model.protocol == "palm":
-            state, state_style = " RETIRED API ", self.style("error", curses.A_BOLD)
-        elif self.api_key:
-            state, state_style = " READY ", self.style("ok", curses.A_BOLD)
-        else:
-            state, state_style = " KEY REQUIRED ", self.style("warning", curses.A_BOLD)
-        self.add(screen, 0, max(width - len(state) - 1, 1), state, state_style)
+        self.draw_header(screen, width)
+        self.add(screen, 1, 0, "-" * max(width - 1, 0), self.style("border"))
 
-        metadata = "  {}  |  {}  |  local session  |  {} turn{}".format(
-            self.model.identifier,
-            self.model.protocol.upper(),
-            len(self.data["history"]) // 2,
-            "s" if len(self.data["history"]) // 2 != 1 else "",
-        )
-        self.add(screen, 1, 0, metadata[: max(width - 1, 0)], self.style("muted"))
-        self.add(screen, 2, 0, "-" * max(width - 1, 0), self.style("border"))
-
-        history_height = max(height - 9, 1)
+        rows = self.input_rows
+        input_top = height - 1 - rows
+        lower_border = input_top - 1
+        upper_border = lower_border - 3
+        history_height = max(upper_border - 2, 1)
         lines = self.render_history(width)
 
         if not lines:
-            empty_row = max(5, (height - 8) // 2)
+            empty_row = max(4, (upper_border - 2) // 2)
             self.add(screen, empty_row, 4, "Start a conversation", self.style("text", curses.A_BOLD))
             self.add(screen, empty_row + 2, 4, "Tab opens the menu. / opens commands.", self.style("muted"))
         visible, self.scroll_offset, _ = self.history_window(lines, history_height, self.scroll_offset)
-        for row, (line, style) in enumerate(visible, start=3):
+        for row, (line, style) in enumerate(visible, start=2):
             self.add(screen, row, 0, line[: max(width - 1, 0)], style)
-        self.add(screen, height - 6, 0, "-" * max(width - 1, 0), self.style("border"))
-        for index, line in enumerate(self.status_lines(width), start=height - 5):
+        self.add(screen, upper_border, 0, "-" * max(width - 1, 0), self.style("border"))
+        for index, line in enumerate(self.status_lines(width), start=upper_border + 1):
             self.add(screen, index, 1, line, self.status_style())
-        self.add(screen, height - 3, 0, "-" * max(width - 1, 0), self.style("border"))
-        self.add(screen, height - 2, 1, ">", self.style("accent", curses.A_BOLD))
+        self.add(screen, lower_border, 0, "-" * max(width - 1, 0), self.style("border"))
+        self.add(screen, input_top, 1, ">", self.style("accent", curses.A_BOLD))
         if self.scroll_offset:
-            footer = "Up/Down/PgUp Scroll   Ctrl+P/Ctrl+O Prompts   {} lines above latest".format(self.scroll_offset)
+            footer = "{} lines above latest".format(self.scroll_offset)
         else:
-            footer = "Tab Menu   / Commands   F6 Transcript   Up/Down/PgUp Scroll"
+            footer = "Tab Menu   / Commands"
         self.add(screen, height - 1, 1, footer[: width - 2], self.style("footer"))
         screen.refresh()
 
     def draw_compact_chat(self, screen: "curses._CursesWindow") -> None:
         height, width = screen.getmaxyx()
-        title = " {} | {} ".format(APP_NAME, self.model.label)
-        self.add(screen, 0, 0, title[: max(width - 1, 0)], curses.A_REVERSE)
+        self.draw_header(screen, width, compact=True)
         history_height = max(height - 4, 1)
         lines = self.render_history(width, compact=True)
         visible, self.scroll_offset, _ = self.history_window(lines, history_height, self.scroll_offset)
-        if self.scroll_offset:
-            title = "{} | +{} lines".format(title.rstrip(), self.scroll_offset)
-            self.add(screen, 0, 0, title[: max(width - 1, 0)], curses.A_REVERSE)
         for row, (line, style) in enumerate(visible, start=1):
             self.add(screen, row, 0, line[: max(width - 1, 0)], style)
         self.add(screen, height - 3, 0, "-" * max(width - 1, 0))
@@ -782,26 +1405,61 @@ class Tui:
         self.add(screen, height - 1, 0, "You > ")
         screen.refresh()
 
+    def read_escape_sequence(self, screen: "curses._CursesWindow") -> str:
+        """After an Esc key, collect whatever else the terminal sent with it (without waiting)."""
+        collected: List[str] = []
+        screen.nodelay(True)
+        try:
+            while len(collected) < 16:
+                try:
+                    key = screen.get_wch()
+                except curses.error:
+                    break
+                if not isinstance(key, str):
+                    break
+                collected.append(key)
+        finally:
+            screen.nodelay(False)
+        return "".join(collected)
+
+    @staticmethod
+    def is_newline_sequence(sequence: str) -> bool:
+        """The escape codes terminals send for Shift+Enter (Esc has already been read)."""
+        return sequence.startswith(("[13;2u", "[27;2;13~", "[13;2~"))
+
     def read_line(self, screen: "curses._CursesWindow", label: str) -> Optional[str]:
         buffer: List[str] = []
         cursor = 0
+        scroll = 0
         history_index = len(self.prompt_history)
         draft: List[str] = []
         while True:
             height, width = screen.getmaxyx()
-            prompt_row = height - 2 if height >= 10 and width >= 42 else height - 1
-            prompt_label = "> " if prompt_row != height - 1 else label
-            available_width = max(width - len(prompt_label) - 2, 1)
-            visible = "".join(buffer)
-            start = max(0, cursor - available_width + 1)
-            rendered = visible[start : start + available_width]
-            self.add(screen, prompt_row, 0, " " * max(width - 1, 0))
-            self.add(screen, prompt_row, 1 if prompt_row != height - 1 else 0, prompt_label + rendered, self.style("input"))
+            compact = height < 10 or width < 42
+            text_column = len(label) if compact else 3
+            max_rows = 1 if compact else max(1, min(MAX_INPUT_ROWS, height - 10))
+            wrap = max(width - text_column - 1, 1)
+            text = "".join(buffer)
+            rows = self.editor_rows(text, wrap)
+            row, column = self.editor_cursor(rows, cursor)
+            shown_rows = min(len(rows), max_rows)
+            if not compact and shown_rows != self.input_rows:
+                self.input_rows = shown_rows
+                self.draw_chat(screen)
+            scroll = min(max(scroll, row - shown_rows + 1), row, max(len(rows) - shown_rows, 0))
+            input_top = height - 1 if compact else height - 1 - self.input_rows
+            for offset in range(shown_rows):
+                self.add(screen, input_top + offset, 0, " " * max(width - 1, 0))
+                index = scroll + offset
+                if index < len(rows):
+                    start, end = rows[index]
+                    self.add(screen, input_top + offset, text_column, text[start:end], self.style("input"))
+            if compact:
+                self.add(screen, input_top, 0, label, self.style("input"))
+            else:
+                self.add(screen, input_top, 1, ">", self.style("accent", curses.A_BOLD))
             try:
-                screen.move(
-                    prompt_row,
-                    min((1 if prompt_row != height - 1 else 0) + len(prompt_label) + cursor - start, width - 1),
-                )
+                screen.move(input_top + row - scroll, min(text_column + column, width - 1))
             except curses.error:
                 pass
             screen.refresh()
@@ -817,8 +1475,16 @@ class Tui:
                 self.scroll_offset = max(0, self.scroll_offset - max(height - 10, 1))
                 self.draw_chat(screen)
                 continue
-            if key in ("\n", "\r"):
+            if key == "\r":
                 return "".join(buffer).strip()
+            if key == "\x1b":
+                if self.is_newline_sequence(self.read_escape_sequence(screen)) and len(buffer) < MAX_INPUT_CHARS:
+                    buffer.insert(cursor, "\n")
+                    cursor += 1
+                continue
+            if key == "\n":
+                # Ctrl+J is deliberately not a shortcut; only Shift+Enter adds a new line.
+                continue
             if key == "\x03":
                 self.running = False
                 return None
@@ -827,9 +1493,6 @@ class Tui:
                 return None
             if key in ("\t", "\x0b"):
                 self.open_action_menu(screen)
-                return None
-            if key == "\x0e":
-                self.clear_context()
                 return None
             if key in (curses.KEY_F2, "\x0c"):
                 self.select_model(screen)
@@ -847,17 +1510,29 @@ class Tui:
                 self.show_transcript(screen)
                 return None
             if key == curses.KEY_UP:
-                self.scroll_offset += 1
-                self.draw_chat(screen)
+                if row > 0:
+                    start, end = rows[row - 1]
+                    cursor = start + min(column, end - start)
+                else:
+                    self.scroll_offset += 1
+                    self.draw_chat(screen)
                 continue
             if key == curses.KEY_DOWN:
-                self.scroll_offset = max(0, self.scroll_offset - 1)
-                self.draw_chat(screen)
+                if row < len(rows) - 1:
+                    start, end = rows[row + 1]
+                    cursor = start + min(column, end - start)
+                else:
+                    self.scroll_offset = max(0, self.scroll_offset - 1)
+                    self.draw_chat(screen)
                 continue
             if key in (curses.KEY_BACKSPACE, "\b", "\x7f"):
                 if cursor:
                     del buffer[cursor - 1]
                     cursor -= 1
+                continue
+            if key == curses.KEY_DC:
+                if cursor < len(buffer):
+                    del buffer[cursor]
                 continue
             if key == curses.KEY_LEFT:
                 cursor = max(0, cursor - 1)
@@ -877,11 +1552,11 @@ class Tui:
                 buffer = list(draft if history_index == len(self.prompt_history) else self.prompt_history[history_index])
                 cursor = len(buffer)
                 continue
-            if key == curses.KEY_HOME:
-                cursor = 0
+            if key in (curses.KEY_HOME, "\x01"):
+                cursor = rows[row][0]
                 continue
-            if key == curses.KEY_END:
-                cursor = len(buffer)
+            if key in (curses.KEY_END, "\x05"):
+                cursor = rows[row][1]
                 continue
             if isinstance(key, str) and key.isprintable():
                 if len(buffer) >= MAX_INPUT_CHARS:
@@ -900,6 +1575,7 @@ class Tui:
                         return None
                     buffer = []
                     cursor = 0
+                    self.draw_chat(screen)
 
     def handle_input(self, screen: "curses._CursesWindow", text: str) -> None:
         if not text:
@@ -912,9 +1588,32 @@ class Tui:
         selected_model = self.model
         self.data["history"].append({"role": "user", "content": text})
         self.store.save(self.data)
-        self.status = "Streaming {}...".format(selected_model.identifier) if self.streaming_enabled else "Waiting for {}...".format(selected_model.identifier)
+        use_tools = self.terminal_tools_active
+        self.stop_requested = False
+        client = GoogleApiClient(self.api_key)
+        if use_tools:
+            self.status = "{}   Waiting for {}...".format(STOP_HINT, selected_model.identifier)
+        elif self.streaming_enabled:
+            self.status = "Streaming {}...".format(selected_model.identifier)
+        else:
+            self.status = "Waiting for {}...".format(selected_model.identifier)
         try:
-            if selected_model.protocol == "gemini" and self.streaming_enabled:
+            if use_tools:
+                self.draw_chat(screen)
+                answer, tool_log = client.generate_with_tools(
+                    selected_model,
+                    self.data["history"],
+                    self.terminal_system_instruction(),
+                    lambda command: self.run_approved_command(screen, command),
+                    lambda: self.poll_stop_request(screen),
+                )
+                content = self.plain_terminal_response(answer)
+                if tool_log:
+                    content = "\n".join(tool_log) + "\n\n" + content
+                self.data["history"].append(
+                    {"role": "model", "content": content, "model_id": client.model_version or selected_model.identifier}
+                )
+            elif selected_model.protocol == "gemini" and self.streaming_enabled:
                 reply = {"role": "model", "content": "", "model_id": selected_model.identifier}
                 self.data["history"].append(reply)
                 self.draw_chat(screen)
@@ -931,20 +1630,21 @@ class Tui:
                             except curses.error:
                                 pass
 
-                answer = GoogleApiClient(self.api_key).generate_stream(
+                answer = client.generate_stream(
                     selected_model, self.data["history"][:-1], self.data.get("system_instruction", ""), append_chunk
                 )
                 reply["content"] = self.plain_terminal_response(answer)
+                reply["model_id"] = client.model_version or selected_model.identifier
             else:
                 self.draw_chat(screen)
-                answer = GoogleApiClient(self.api_key).generate(
+                answer = client.generate(
                     selected_model, self.data["history"], self.data.get("system_instruction", "")
                 )
                 self.data["history"].append(
                     {
                         "role": "model",
                         "content": self.plain_terminal_response(answer),
-                        "model_id": selected_model.identifier,
+                        "model_id": client.model_version or selected_model.identifier,
                     }
                 )
             self.status = "Response complete."
@@ -958,7 +1658,132 @@ class Tui:
             self.status = "{} Use /retry or Up to recall the prompt.".format(
                 self.friendly_error(error, selected_model)
             )
+        finally:
+            self.add_usage(client)
         self.store.save(self.data)
+
+    def add_usage(self, client: "GoogleApiClient") -> None:
+        usage = self.data["usage"]
+        usage["input"] += client.usage_input
+        usage["output"] += client.usage_output
+
+    def poll_stop_request(self, screen: "curses._CursesWindow", running: str = "") -> bool:
+        """Non-blocking check for Esc while a terminal turn is in progress. Other keys are discarded."""
+        if self.stop_requested:
+            return True
+        screen.nodelay(True)
+        try:
+            while True:
+                try:
+                    key = screen.get_wch()
+                except curses.error:
+                    break
+                if key == "\x1b":
+                    self.stop_requested = True
+        finally:
+            screen.nodelay(False)
+        if self.stop_requested:
+            self.status = "Stopping..."
+            self.draw_chat(screen)
+        return self.stop_requested
+
+    def terminal_system_instruction(self) -> str:
+        note = (
+            "You can run shell commands on the user's computer with the {} tool. The user may deny a command "
+            "or stop the turn; do not retry a denied command. Platform: {}. Working directory: {}. Use non-interactive commands, "
+            "keep output small, and explain what you did in plain text. You get at most {limit} terminal results per turn."
+        ).format(TERMINAL_TOOL_NAME, sys.platform, Path.cwd(), limit=MAX_TERMINAL_RESULTS)
+        base = self.data.get("system_instruction", "").strip()
+        return (base + "\n\n" + note) if base else note
+
+    def run_approved_command(self, screen: "curses._CursesWindow", command: str) -> Tuple[dict, str]:
+        shown = " ".join(command.split())
+        if len(shown) > 120:
+            shown = shown[:117] + "..."
+        review = classify_command(command)
+        # "Allow all" never covers risky commands; those ask every time.
+        skip_prompt = self.command_permissions == "all" or (
+            self.command_permissions == "safe" and not review.needs_confirmation
+        )
+        if not skip_prompt:
+            decision = self.confirm_command(screen, command, review)
+            if decision == "all" and not review.needs_confirmation:
+                self.command_permissions = "safe"
+            elif decision not in ("yes", "all"):
+                return (
+                    {"error": "The user denied this command. Do not retry it; ask the user how to proceed."},
+                    "[terminal] denied [{}]: {}".format(review.primary, shown),
+                )
+        self.status = "{}   Running: {}".format(STOP_HINT, shown)
+        self.draw_chat(screen)
+        result = run_shell_command(command, should_stop=lambda: self.poll_stop_request(screen))
+        if "error" in result:
+            return result, "[terminal] failed to start [{}]: {}".format(review.primary, shown)
+        if result.get("stopped_by_user"):
+            suffix = "stopped by you"
+            result["output"] = (result.get("output", "") + "\n[The user stopped this command.]").lstrip("\n")
+        else:
+            suffix = "timed out" if result.get("timed_out") else "exit {}".format(result.get("exit_code"))
+        return result, "[terminal] ran [{}]: {} ({})".format(review.primary, shown, suffix)
+
+    def confirm_command(
+        self, screen: "curses._CursesWindow", command: str, review: Optional["CommandReview"] = None
+    ) -> str:
+        """Ask before running a model-requested command. Returns yes, all, or no."""
+        review = review or classify_command(command)
+        height, width = screen.getmaxyx()
+        window_width = max(min(width - 4, 100), 24)
+        inner = window_width - 6
+        body: List[str] = []
+        for line in command.splitlines() or [command]:
+            body.extend(textwrap.wrap(line, inner, replace_whitespace=False, drop_whitespace=False) or [""])
+        # Title, blank, command, blank, type line, footer, plus the box border.
+        fixed_rows = 6
+        if len(body) > max(height - fixed_rows - 2, 1):
+            # Never approve a command whose full text cannot be shown.
+            return "no"
+        category_style = {
+            "READ": self.style("ok"),
+            "CREATION": self.style("accent"),
+            "WRITE": self.style("warning"),
+            "REMOVAL": self.style("error"),
+        }
+        type_line = "Type: {}".format(review.primary)
+        if len(review.categories) > 1:
+            type_line += "   (also: {})".format(", ".join(review.categories[:-1][::-1]))
+        extra: List[Tuple[str, int]] = []
+        for reason in review.risks:
+            for wrapped in textwrap.wrap("RISKY: " + reason, inner) or [""]:
+                extra.append((wrapped, self.style("error", curses.A_BOLD)))
+        for note in review.notes:
+            for wrapped in textwrap.wrap(note, inner) or [""]:
+                extra.append((wrapped, self.style("muted")))
+        extra = extra[: max(height - fixed_rows - 2 - len(body), 0)]
+        window_height = min(len(body) + len(extra) + fixed_rows + 2, height)
+        window = curses.newwin(window_height, window_width, max((height - window_height) // 2, 0), max((width - window_width) // 2, 0))
+        window.keypad(True)
+        footer = "Y run   N/Esc deny" if review.needs_confirmation else "Y run   N/Esc deny   A allow all safe until restart"
+        if review.needs_confirmation:
+            footer += "   (always asks)"
+        while True:
+            window.erase()
+            window.box()
+            self.add(window, 1, 2, "Run this command?"[: window_width - 4], curses.A_BOLD)
+            for index, line in enumerate(body):
+                self.add(window, 3 + index, 3, self.sanitize_display(line)[:inner])
+            row = 4 + len(body)
+            self.add(window, row, 3, type_line[:inner], category_style[review.primary] | curses.A_BOLD)
+            for offset, (text, style) in enumerate(extra, start=1):
+                self.add(window, row + offset, 3, text[:inner], style)
+            self.add(window, window_height - 2, 2, footer[: window_width - 4], curses.A_DIM)
+            window.refresh()
+            key = window.get_wch()
+            if isinstance(key, str) and key.lower() == "y":
+                return "yes"
+            if isinstance(key, str) and key.lower() == "a" and not review.needs_confirmation:
+                return "all"
+            if (isinstance(key, str) and key.lower() == "n") or self.is_cancel_key(key):
+                return "no"
 
     def friendly_error(self, error: ApiError, model: ModelSpec) -> str:
         raw = str(error)
@@ -970,6 +1795,7 @@ class Tui:
 
     def clear_context(self) -> None:
         self.data["history"] = []
+        self.data["usage"] = {"input": 0, "output": 0}
         self.scroll_offset = 0
         self.store.save(self.data)
         self.status = "Context cleared."
@@ -985,48 +1811,32 @@ class Tui:
     def handle_command(self, screen: "curses._CursesWindow", text: str) -> None:
         command, _, argument = text.partition(" ")
         command = command.lower()
-        if command in ("/quit", "/exit"):
-            self.running = False
-        elif command in ("/restart", "/reopen"):
+        if command in ("/restart", "/reopen"):
             self.restart_requested = True
             self.running = False
-        elif command in ("/new", "/clear"):
+        elif command == "/clear":
             self.clear_context()
         elif command == "/model":
             self.select_model(screen)
-        elif command == "/models":
-            self.show_models(screen)
         elif command == "/retry":
             self.retry_last(screen)
-        elif command == "/settings":
-            self.open_settings(screen)
-        elif command in ("/transcript", "/history"):
-            self.show_transcript(screen)
-        elif command == "/system":
-            if argument.strip():
-                self.data["system_instruction"] = argument.strip()[:MAX_DIALOG_CHARS]
-                self.data["settings"]["system_instruction_configured"] = True
-                self.store.save(self.data)
-                self.status = "System instruction updated."
+        elif command == "/permissions":
+            if self.terminal_tools_setting:
+                self.select_command_permissions(screen)
             else:
-                self.edit_system_instruction(screen)
+                self.status = "Turn on Terminal access in Settings to use /permissions."
         elif command == "/key":
             self.configure_api_key(screen)
         elif command == "/check":
             self.check_availability(screen)
-        elif command == "/help":
-            self.show_help(screen)
         else:
-            self.status = "Unknown command. Try /help."
+            self.status = "Unknown command. Type / to see the commands."
 
     def open_action_menu(self, screen: "curses._CursesWindow") -> None:
         actions = (
-            ("Choose model", "Browse and filter the model catalog", "model"),
             ("Settings", "Themes, streaming, system instruction, API key, and availability", "settings"),
             ("View transcript", "Read the complete rewrapped conversation", "transcript"),
             ("Clear context", "Remove the shared conversation history", "clear"),
-            ("Retry failed prompt", "Run the most recent failed prompt again", "retry"),
-            ("Restart interface", "Close and reopen the terminal interface", "restart"),
             ("Help", "Show shortcuts and slash commands", "help"),
             ("Exit", "Close Gemini Legacy", "exit"),
         )
@@ -1067,17 +1877,10 @@ class Tui:
             action = actions[selected][2]
             if action == "clear":
                 self.clear_context()
-            elif action == "model":
-                self.select_model(screen)
             elif action == "settings":
                 self.open_settings(screen)
             elif action == "transcript":
                 self.show_transcript(screen)
-            elif action == "retry":
-                self.retry_last(screen)
-            elif action == "restart":
-                self.restart_requested = True
-                self.running = False
             elif action == "help":
                 self.show_help(screen)
             elif action == "exit":
@@ -1089,6 +1892,7 @@ class Tui:
         selected = 0
         settings = (
             ("Streaming", "Render Gemini output as it arrives", "stream"),
+            ("Terminal access", "Let supported models run shell commands (you approve each)", "tools"),
             ("Theme", "Choose the terminal color palette", "theme"),
             ("System instruction", "Set or clear the instruction for this chat", "system"),
             ("API key", "Enter an API key for this run only", "key"),
@@ -1124,6 +1928,10 @@ class Tui:
                 style = self.style("selected") if index == selected else self.style("text")
                 if label == "Streaming":
                     value = "[ON]" if self.streaming_enabled else "[OFF]"
+                elif label == "Terminal access":
+                    value = "[ON]" if self.terminal_tools_setting else "[OFF]"
+                    if not model_supports_terminal_tools(self.model.identifier):
+                        value += " (not supported by {})".format(self.model.identifier)
                 elif label == "Theme":
                     value = self.theme.label
                 elif label == "System instruction":
@@ -1149,7 +1957,7 @@ class Tui:
                 selected = min(len(settings) - 1, selected + 1)
                 continue
             action = settings[selected][2]
-            if key == " " and action != "stream":
+            if key == " " and action not in ("stream", "tools"):
                 continue
             if key not in (" ", "\n", "\r"):
                 continue
@@ -1157,6 +1965,14 @@ class Tui:
                 self.data["settings"]["streaming"] = not self.streaming_enabled
                 self.store.save(self.data)
                 self.status = "Streaming {}.".format("enabled" if self.streaming_enabled else "disabled")
+            elif action == "tools":
+                self.data["settings"]["terminal_tools"] = not self.terminal_tools_setting
+                self.command_permissions = "ask"
+                self.store.save(self.data)
+                if self.terminal_tools_setting:
+                    self.status = "Terminal access on for gemini-flash-latest, Gemini 4+, and Gemini 3.8 Flash+. Each command needs your approval. Streaming is off while it is used."
+                else:
+                    self.status = "Terminal access disabled."
             elif action == "theme":
                 self.select_theme(screen)
             elif action == "system":
@@ -1240,7 +2056,8 @@ class Tui:
             matches = [
                 command
                 for command in SLASH_COMMANDS
-                if query.lower() in "{} {}".format(command[0], command[1]).lower()
+                if (command[0] != "/permissions" or self.terminal_tools_setting)
+                and query.lower() in "{} {}".format(command[0], command[1]).lower()
             ]
             if matches and selected_command not in {command[0] for command in matches}:
                 selected_command = matches[0][0]
@@ -1307,7 +2124,7 @@ class Tui:
             height, width = screen.getmaxyx()
             matches = [
                 model
-                for model in (*MODEL_CATALOG, CUSTOM_MODEL_PICKER_ENTRY)
+                for model in (CUSTOM_MODEL_PICKER_ENTRY, *MODEL_CATALOG)
                 if query.lower() in "{} {} {}".format(model.identifier, model.label, model.group).lower()
             ]
             if matches and selected_id not in {model.identifier for model in matches}:
@@ -1327,7 +2144,11 @@ class Tui:
                 availability = self.availability_marker(model)
                 group = model.group.upper() if model.group != last_group else " " * len(model.group)
                 line = "{}{: <20}  {: <34} {}".format(prefix, group, model.label, availability)
-                self.add(screen, displayed, 0, line[: width - 1], self.style("selected") if model.identifier == selected_id else self.style("text"))
+                if model.identifier == selected_id:
+                    line_style = self.style("selected", curses.A_DIM if model.retired else 0)
+                else:
+                    line_style = self.style("muted") if model.retired else self.style("text")
+                self.add(screen, displayed, 0, line[: width - 1], line_style)
                 last_group = model.group
             if matches:
                 focused = matches[selected]
@@ -1350,10 +2171,10 @@ class Tui:
                     continue
                 self.data["model"] = selected_model.identifier
                 self.store.save(self.data)
-                if self.model.protocol == "palm":
-                    self.status = "PaLM Chat-Bison 001 is retired. Select a Gemini Flash model (Ctrl+L)."
+                if selected_model.retired:
+                    self.status = "Selected {}, which is likely unavailable. Shared context is retained.".format(selected_model.label)
                 else:
-                    self.status = "Selected {}. Shared context is retained; Ctrl+N clears it.".format(self.model.label)
+                    self.status = "Selected {}. Shared context is retained.".format(selected_model.label)
                 self.show_cursor()
                 return
             if self.is_cancel_key(key) or key in ("q", "Q"):
@@ -1435,8 +2256,174 @@ class Tui:
             lines.extend("  {} ({})".format(model.label, model.identifier) for model in unavailable)
         return lines
 
+    @staticmethod
+    def editor_rows(text: str, wrap: int) -> List[Tuple[int, int]]:
+        """Visual rows of the text editor as (start, end) offsets; long lines wrap at a fixed width."""
+        rows: List[Tuple[int, int]] = []
+        offset = 0
+        for line in text.split("\n"):
+            for chunk in range(len(line) // wrap + 1):
+                rows.append((offset + chunk * wrap, min(offset + len(line), offset + (chunk + 1) * wrap)))
+            offset += len(line) + 1
+        return rows
+
+    @staticmethod
+    def editor_cursor(rows: List[Tuple[int, int]], cursor: int) -> Tuple[int, int]:
+        row = 0
+        for index, (start, end) in enumerate(rows):
+            if start <= cursor <= end:
+                row = index
+        return row, cursor - rows[row][0]
+
+    def edit_text_dialog(
+        self, screen: "curses._CursesWindow", title: str, initial: str, max_length: int = MAX_DIALOG_CHARS
+    ) -> Optional[str]:
+        """A full-screen multi-line editor. Ctrl+D saves, Esc cancels; Enter inserts a new line."""
+        text = initial.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")[:max_length]
+        cursor = len(text)
+        top = 0
+        previous_enter = False
+        while True:
+            height, width = screen.getmaxyx()
+            if height < 8 or width < 24:
+                self.status = "Terminal is too small for the editor. Resize it and try again."
+                return None
+            wrap = width - 4
+            rows = self.editor_rows(text, wrap)
+            row, column = self.editor_cursor(rows, cursor)
+            visible = height - 4
+            top = min(max(top, row - visible + 1), row)
+            screen.erase()
+            self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("header"))
+            self.add(screen, 0, 1, title[: width - 2], self.style("header", curses.A_BOLD))
+            for screen_row, (start, end) in enumerate(rows[top : top + visible], start=2):
+                printable = "".join(character if character.isprintable() else " " for character in text[start:end])
+                self.add(screen, screen_row, 2, printable, self.style("text"))
+            footer = "Ctrl+D save   Esc cancel   Enter new line   Ctrl+U clear all   {} chars".format(len(text))
+            self.add(screen, height - 1, 1, footer[: width - 2], self.style("footer"))
+            try:
+                curses.curs_set(1)
+                screen.move(2 + row - top, min(2 + column, width - 2))
+            except curses.error:
+                pass
+            screen.refresh()
+            key = screen.get_wch()
+            if key == "\x04":
+                self.show_cursor()
+                return text.strip()
+            if self.is_cancel_key(key):
+                self.show_cursor()
+                return None
+            if key in ("\n", "\r"):
+                # A pasted CRLF arrives as two keys; count it as one new line.
+                if not (key == "\n" and previous_enter) and len(text) < max_length:
+                    text = text[:cursor] + "\n" + text[cursor:]
+                    cursor += 1
+                previous_enter = key == "\r"
+                continue
+            previous_enter = False
+            if key in (curses.KEY_BACKSPACE, "\b", "\x7f"):
+                if cursor:
+                    text = text[: cursor - 1] + text[cursor:]
+                    cursor -= 1
+            elif key == curses.KEY_DC:
+                text = text[:cursor] + text[cursor + 1 :]
+            elif key == curses.KEY_LEFT:
+                cursor = max(0, cursor - 1)
+            elif key == curses.KEY_RIGHT:
+                cursor = min(len(text), cursor + 1)
+            elif key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE):
+                step = {curses.KEY_UP: -1, curses.KEY_DOWN: 1, curses.KEY_PPAGE: -visible, curses.KEY_NPAGE: visible}[key]
+                target = min(max(row + step, 0), len(rows) - 1)
+                start, end = rows[target]
+                cursor = start + min(column, end - start)
+            elif key in (curses.KEY_HOME, "\x01"):
+                cursor = rows[row][0]
+            elif key in (curses.KEY_END, "\x05"):
+                cursor = rows[row][1]
+            elif key == "\x15":
+                text = ""
+                cursor = 0
+            elif isinstance(key, str) and key.isprintable() and len(text) < max_length:
+                text = text[:cursor] + key + text[cursor:]
+                cursor += 1
+
+    def confirm_dialog(self, screen: "curses._CursesWindow", title: str, lines: Sequence[str]) -> bool:
+        height, width = screen.getmaxyx()
+        window_width = max(min(width - 4, 80), 24)
+        body: List[str] = []
+        for line in lines:
+            body.extend(textwrap.wrap(line, window_width - 6) or [""])
+        body = body[: max(height - 6, 1)]
+        window_height = min(len(body) + 6, height)
+        window = curses.newwin(window_height, window_width, max((height - window_height) // 2, 0), max((width - window_width) // 2, 0))
+        window.keypad(True)
+        while True:
+            window.erase()
+            window.box()
+            self.add(window, 1, 2, title[: window_width - 4], curses.A_BOLD)
+            for index, line in enumerate(body):
+                self.add(window, 3 + index, 3, line[: window_width - 6])
+            self.add(window, window_height - 2, 2, "Y confirm   N/Esc cancel"[: window_width - 4], curses.A_DIM)
+            window.refresh()
+            key = window.get_wch()
+            if isinstance(key, str) and key.lower() == "y":
+                return True
+            if (isinstance(key, str) and key.lower() == "n") or self.is_cancel_key(key):
+                return False
+
+    def select_command_permissions(self, screen: "curses._CursesWindow") -> None:
+        options = (
+            ("ask", "Ask approval each time", "Every command shows a dialog and waits for Y or N."),
+            ("safe", "Allow all safe", "Run read, creation and write commands without asking. Removals and risky commands still ask."),
+            ("all", "Allow literally everything", "Run every command with no prompts, including removals, sudo, installs, and git push."),
+        )
+        selected = next((index for index, option in enumerate(options) if option[0] == self.command_permissions), 0)
+        while True:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+            screen.erase()
+            height, width = screen.getmaxyx()
+            self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("header"))
+            self.add(screen, 0, 1, "TERMINAL PERMISSIONS", self.style("header", curses.A_BOLD))
+            self.add(screen, 2, 2, "Applies to commands the model asks to run. Resets to 'ask' when you restart.", self.style("muted"))
+            self.add(screen, 3, 0, "-" * max(width - 1, 0), self.style("border"))
+            for index, (identifier, label, description) in enumerate(options):
+                row = 5 + index * 3
+                if row + 1 >= height - 1:
+                    break
+                current = "(current)" if identifier == self.command_permissions else ""
+                style = self.style("selected") if index == selected else self.style("text")
+                if identifier == "all" and index != selected:
+                    style = self.style("error")
+                self.add(screen, row, 2, "{}  {: <28} {}".format(">" if index == selected else " ", label, current)[: width - 4], style)
+                self.add(screen, row + 1, 5, description[: width - 7], self.style("muted"))
+            self.add(screen, height - 1, 2, "Up/Down select   Enter choose   Esc close", self.style("footer"))
+            screen.refresh()
+            key = screen.get_wch()
+            if self.is_cancel_key(key) or key in ("q", "Q"):
+                break
+            if key in (curses.KEY_UP, "k"):
+                selected = max(0, selected - 1)
+            elif key in (curses.KEY_DOWN, "j"):
+                selected = min(len(options) - 1, selected + 1)
+            elif key in ("\n", "\r"):
+                identifier, label = options[selected][0], options[selected][1]
+                if identifier == "all" and not self.confirm_dialog(
+                    screen,
+                    "Allow literally everything?",
+                    ["Every command the model requests will run immediately with no prompt, including deletions, sudo, and installs, until you restart or turn Terminal access off."],
+                ):
+                    continue
+                self.command_permissions = identifier
+                self.status = "Terminal permissions: {}.".format(label)
+                break
+        self.show_cursor()
+
     def edit_system_instruction(self, screen: "curses._CursesWindow") -> None:
-        value = self.prompt_dialog(
+        value = self.edit_text_dialog(
             screen,
             "System instruction",
             self.data.get("system_instruction", ""),
@@ -1528,18 +2515,14 @@ class Tui:
             screen,
             "Help",
             [
-                "Tab opens the main menu. Type / for the searchable command palette.",
-                "Up/Down or Page Up/Page Down scroll the chat. Ctrl+P/Ctrl+O recall submitted prompts.",
-                "F6 or /transcript opens the complete conversation reader with Up/Down scrolling.",
-                "Settings contains streaming, themes, system instruction, API key, and model availability.",
-                "/clear erases context; /retry repeats a failed prompt; /restart reopens the UI.",
+                "Tab opens the main menu (settings, help, transcript, exit). Type / for the searchable command palette.",
+                "Enter sends; Shift+Enter adds a new line (see the README for terminal setup). Up/Down or Page Up/Page Down scroll the chat. Ctrl+P/Ctrl+O recall submitted prompts.",
+                "F6 opens the complete conversation reader with Up/Down scrolling.",
+                "Settings contains streaming, terminal access, themes, system instruction, API key, and model availability.",
+                "/clear erases context; /retry repeats a failed prompt; /restart reopens the UI; /permissions sets terminal approval (when Terminal access is on).",
                 "API keys are never written to disk. Transcripts live in the selected state folder.",
             ],
         )
-
-    def show_models(self, screen: "curses._CursesWindow") -> None:
-        lines = ["{} [{}] - {}".format(model.identifier, model.group, self.availability_marker(model)) for model in MODEL_CATALOG]
-        self.show_message(screen, "Configured model catalog", lines)
 
     def show_transcript(self, screen: "curses._CursesWindow") -> None:
         self.show_message(screen, "Complete transcript", self.transcript_lines())
@@ -1691,6 +2674,8 @@ class Tui:
         return self.colors.get(name, 0) | extra
 
     def status_style(self) -> int:
+        if STOP_HINT in self.status:
+            return self.style("warning", curses.A_BOLD | curses.A_REVERSE)
         lowered = self.status.lower()
         if any(token in lowered for token in ("http", "error", "no api key", "network", "invalid", "timed out")):
             return self.style("error", curses.A_BOLD)
@@ -1706,7 +2691,7 @@ class Tui:
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Terminal UI for Gemini Flash and legacy PaLM chat models.")
+    parser = argparse.ArgumentParser(description="Terminal UI for Gemini models and legacy PaLM chat.")
     parser.add_argument(
         "--api-key-file",
         type=Path,
@@ -1719,6 +2704,10 @@ def parse_arguments() -> argparse.Namespace:
         help="Directory used for the local conversation transcript (default: ./.gemini-legacy-tui).",
     )
     parser.add_argument("--list-models", action="store_true", help="Print the built-in model catalog and exit.")
+    parser.add_argument(
+        "--api-base-url",
+        help="Send API requests to a local test server such as tools/mock_gemini_server.py (loopback http:// URLs only).",
+    )
     return parser.parse_args()
 
 
@@ -1728,6 +2717,13 @@ def main() -> int:
         for model in MODEL_CATALOG:
             print("{}\t{}\t{}".format(model.identifier, model.group, model.availability_note))
         return 0
+    if arguments.api_base_url:
+        global API_BASE_URL
+        parsed_base = urllib.parse.urlparse(arguments.api_base_url)
+        if parsed_base.scheme != "http" or parsed_base.hostname not in ("127.0.0.1", "localhost", "::1") or parsed_base.path not in ("", "/"):
+            print("--api-base-url must be a loopback address like http://127.0.0.1:8765", file=sys.stderr)
+            return 2
+        API_BASE_URL = "http://{}".format(parsed_base.netloc)
     restart_key = os.environ.pop("GEMINI_LEGACY_TUI_RESTART_KEY", "")
     api_key_from_file = ""
     if arguments.api_key_file:
@@ -1750,6 +2746,7 @@ def main() -> int:
     store = SessionStore(arguments.state_dir)
     app = Tui(api_key, store)
     try:
+        os.environ.setdefault("ESCDELAY", "25")  # make a lone Esc respond immediately
         curses.wrapper(app.run)
     except KeyboardInterrupt:
         return 0
