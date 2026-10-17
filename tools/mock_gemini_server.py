@@ -42,7 +42,9 @@ def build_reply(body):
         return {"call": {"name": "run_terminal_command", "args": {"command": command}, "id": "mock-call"}}
     if text.lower().startswith("run "):
         return {"text": "Mock model: terminal access is off or unsupported for this model, so I cannot run commands."}
-    return {"text": "Mock model reply to: {}".format(text or "(empty)")}
+    config = body.get("generationConfig")
+    suffix = "  [generationConfig: {}]".format(json.dumps(config, sort_keys=True)) if config else ""
+    return {"text": "Mock model reply to: {}{}".format(text or "(empty)", suffix)}
 
 
 def candidate(reply, model="mock-model"):
@@ -69,6 +71,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.headers.get("x-goog-api-key"):
             return self.send_json({"error": {"message": "missing key"}}, 401)
+        if "/models/" in self.path:
+            name = self.path.split("/models/")[-1].split("?")[0]
+            return self.send_json({"name": "models/" + name, "inputTokenLimit": 1048576, "outputTokenLimit": 65536})
         names = ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-latest"]
         self.send_json({"models": [{"name": "models/" + name} for name in names]})
 

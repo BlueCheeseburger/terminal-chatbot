@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import urllib.error
 import curses
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,6 +26,10 @@ from gemini_legacy_tui import (
     SLASH_COMMANDS,
     SessionStore,
     Tui,
+    build_generation_config,
+    estimate_cost,
+    parse_generation_value,
+    thinking_support,
     classify_command,
     model_supports_terminal_tools,
     run_shell_command,
@@ -278,7 +283,7 @@ class ClientTests(unittest.TestCase):
                 MODEL_BY_ID["gemini-3-flash-preview"],
             )
         self.assertIn("gemini-3-flash-preview is unavailable", message)
-        self.assertIn("Ctrl+L", message)
+        self.assertIn("/model", message)
 
     def test_large_stream_chunk_is_split_for_progressive_display(self):
         self.assertEqual(Tui.display_fragments("abcdefghijklmnopq", width=8), ["abcdefgh", "ijklmnop", "q"])
@@ -464,7 +469,7 @@ class ClientTests(unittest.TestCase):
     def test_command_palette_lists_every_supported_user_command(self):
         commands = {command for command, _ in SLASH_COMMANDS}
         self.assertTrue(
-            {"/clear", "/model", "/retry", "/permissions", "/key", "/check", "/restart"}.issubset(commands)
+            {"/clear", "/model", "/thinking", "/retry", "/permissions", "/restart"}.issubset(commands)
         )
         self.assertFalse({"/new", "/models", "/transcript", "/stop", "/quit", "/help", "/system", "/settings"} & commands)
 
@@ -772,24 +777,28 @@ class ClientTests(unittest.TestCase):
                 {"role": "model", "content": "b", "model_id": "gemini-4-argon"},
                 {"role": "user", "content": "c"},
             ]
-            tui.data["usage"] = {"input": 1234, "output": 56}
+            tui.data["usage"] = {"input": 1234, "output": 56, "cost": 0.00432, "unpriced": False}
             model_id, rest = tui.header_parts()
             self.assertEqual(model_id, "gemini-4-argon")
             self.assertIn("2 turns", rest)
             self.assertIn("1,234 in / 56 out tokens", rest)
+            self.assertTrue(rest.endswith("~$0.0043"))
             for old in ("GEMINI LEGACY", "READY", "local session"):
                 self.assertNotIn(old, model_id + rest)
 
     def test_usage_is_normalized_persisted_and_cleared(self):
-        self.assertEqual(SessionStore.normalize({})["usage"], {"input": 0, "output": 0})
+        self.assertEqual(SessionStore.normalize({})["usage"], {"input": 0, "output": 0, "context": 0, "cost": 0.0, "unpriced": False})
         bad = SessionStore.normalize({"usage": {"input": -5, "output": "x"}})["usage"]
-        self.assertEqual(bad, {"input": 0, "output": 0})
-        self.assertEqual(SessionStore.normalize({"usage": {"input": 7, "output": 9}})["usage"], {"input": 7, "output": 9})
+        self.assertEqual(bad, {"input": 0, "output": 0, "context": 0, "cost": 0.0, "unpriced": False})
+        self.assertEqual(
+            SessionStore.normalize({"usage": {"input": 7, "output": 9, "cost": 0.5, "unpriced": True}})["usage"],
+            {"input": 7, "output": 9, "context": 0, "cost": 0.5, "unpriced": True},
+        )
         with tempfile.TemporaryDirectory() as directory:
             tui = Tui("", SessionStore(Path(directory)))
-            tui.data["usage"] = {"input": 7, "output": 9}
+            tui.data["usage"] = {"input": 7, "output": 9, "context": 5, "cost": 1.0, "unpriced": True}
             tui.clear_context()
-            self.assertEqual(tui.data["usage"], {"input": 0, "output": 0})
+            self.assertEqual(tui.data["usage"], {"input": 0, "output": 0, "context": 0, "cost": 0.0, "unpriced": False})
 
     @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open")
     def test_client_records_tokens_and_the_model_version_the_api_reports(self, mocked_open):
@@ -827,9 +836,9 @@ class ClientTests(unittest.TestCase):
     def test_action_menu_has_no_model_retry_or_restart_entries(self):
         source = Path(app.__file__).read_text()
         menu = source[source.index("def open_action_menu") : source.index("def open_settings")]
-        for removed in ("Choose model", "Retry failed prompt", "Restart interface"):
+        for removed in ("Choose model", "Retry failed prompt", "Restart interface", "Clear context"):
             self.assertNotIn(removed, menu)
-        for kept in ("Settings", "View transcript", "Clear context", "Help", "Exit"):
+        for kept in ("Settings", "View transcript", "Help", "Exit"):
             self.assertIn(kept, menu)
 
     SHIFT_ENTER = ["\x1b", "[", "1", "3", ";", "2", "u", None]
@@ -862,6 +871,287 @@ class ClientTests(unittest.TestCase):
             with patch.object(tui, "open_command_palette", return_value=None), patch.object(tui, "draw_chat") as draw:
                 tui.read_line(FakeScreen(["/", "a", "\r"]), "You > ")
             self.assertTrue(draw.called)
+
+    def test_cost_estimates_use_dated_prices_and_unknown_models_have_none(self):
+        before, after = date(2026, 10, 14), date(2026, 12, 1)
+        self.assertAlmostEqual(estimate_cost("gemini-4-argon", 1_000_000, 1_000_000, before), 12.0)
+        self.assertAlmostEqual(estimate_cost("gemini-4-argon", 1_000_000, 1_000_000, after), 24.0)
+        self.assertAlmostEqual(estimate_cost("gemini-3.8-flash", 2_000_000, 1_000_000, before), 5.25)
+        self.assertAlmostEqual(estimate_cost("gemini-2.5-flash", 1_000_000, 0, before), 0.30)
+        self.assertAlmostEqual(estimate_cost("gemini-3.8-flash-001", 1_000_000, 0, before), 0.75)
+        self.assertEqual(estimate_cost("gemini-mock-model", 100, 100), 0.0)
+        self.assertIsNone(estimate_cost("gemini-3.7-flash", 10, 10, before))
+        self.assertIsNone(estimate_cost("my-custom-model", 10, 10, before))
+
+    def test_usage_cost_accumulates_and_flags_unpriced_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+            client = GoogleApiClient("k")
+            client.usage_input, client.usage_output = 1_000_000, 100_000
+            client.model_version = "gemini-2.5-flash"
+            tui.add_usage(client, "gemini-flash-latest")
+            self.assertAlmostEqual(tui.data["usage"]["cost"], 0.55)
+            self.assertFalse(tui.data["usage"]["unpriced"])
+            self.assertTrue(tui.format_cost(tui.data["usage"]).startswith("~$0.55"))
+            client.model_version = ""
+            tui.add_usage(client, "gemini-3.7-flash")
+            self.assertTrue(tui.data["usage"]["unpriced"])
+            self.assertTrue(tui.format_cost(tui.data["usage"]).endswith("+"))
+            self.assertEqual(Tui.format_cost({"cost": 0.0, "unpriced": True}), "cost unknown")
+
+    def test_generation_config_only_sends_set_values_and_maps_thinking_per_model(self):
+        self.assertEqual(build_generation_config({}, "gemini-4-argon"), {})
+        settings = {"temperature": 0.4, "top_p": 0.9, "top_k": 20, "max_output_tokens": 500, "seed": 7,
+                    "presence_penalty": 0.5, "frequency_penalty": -0.5, "stop_sequences": ["END"],
+                    "thinking_level": "high", "thinking_budget": 2048}
+        argon = build_generation_config(settings, "gemini-4-argon")
+        self.assertEqual(argon["thinkingConfig"], {"thinkingLevel": "HIGH"})
+        self.assertEqual((argon["temperature"], argon["topP"], argon["topK"], argon["maxOutputTokens"], argon["seed"]), (0.4, 0.9, 20, 500, 7))
+        self.assertEqual((argon["presencePenalty"], argon["frequencyPenalty"], argon["stopSequences"]), (0.5, -0.5, ["END"]))
+        self.assertEqual(build_generation_config(settings, "gemini-2.5-flash")["thinkingConfig"], {"thinkingBudget": 2048})
+        # A level the model does not accept is left out rather than causing an API error.
+        self.assertNotIn("thinkingConfig", build_generation_config({"thinking_level": "minimal"}, "gemini-4-argon"))
+        self.assertEqual(build_generation_config({"thinking_level": "minimal"}, "gemini-3.6-flash")["thinkingConfig"], {"thinkingLevel": "MINIMAL"})
+        self.assertEqual(thinking_support("chat-bison-001")[0], "none")
+
+    def test_generation_values_are_validated(self):
+        self.assertEqual(parse_generation_value("temperature", "1.5"), 1.5)
+        self.assertEqual(parse_generation_value("top_k", "40"), 40)
+        self.assertEqual(parse_generation_value("stop_sequences", "a, b ,,c"), ["a", "b", "c"])
+        self.assertEqual(parse_generation_value("thinking_budget", "-1"), -1)
+        for key, text in (("temperature", "3"), ("temperature", "hot"), ("top_p", "-0.1"), ("top_k", "1.5"),
+                          ("max_output_tokens", "0"), ("stop_sequences", "1,2,3,4,5,6"), ("thinking_budget", "99999")):
+            with self.assertRaises(ApiError, msg=(key, text)):
+                parse_generation_value(key, text)
+        cleaned = SessionStore.normalize({"settings": {"generation": {
+            "temperature": 9, "top_p": 0.5, "thinking_level": "extreme", "bogus": 1, "seed": True, "stop_sequences": []}}})
+        self.assertEqual(cleaned["settings"]["generation"], {"top_p": 0.5})
+
+    @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open")
+    def test_request_body_carries_generation_settings_and_skips_thought_parts(self, mocked_open):
+        mocked_open.return_value = FakeResponse({"candidates": [{"content": {"parts": [
+            {"text": "secret reasoning", "thought": True}, {"text": "the answer"}]}}]})
+        client = GoogleApiClient("k", {"temperature": 0.2, "thinking_level": "low"})
+        answer = client.generate(MODEL_BY_ID["gemini-4-argon"], [{"role": "user", "content": "Hi"}], "")
+        body = json.loads(mocked_open.call_args.args[0].data)
+        self.assertEqual(answer, "the answer")
+        self.assertEqual(body["generationConfig"], {"temperature": 0.2, "thinkingConfig": {"thinkingLevel": "LOW"}})
+        mocked_open.return_value = FakeResponse({"candidates": [{"content": {"parts": [{"text": "x"}]}}]})
+        GoogleApiClient("k").generate(MODEL_BY_ID["gemini-4-argon"], [{"role": "user", "content": "Hi"}], "")
+        self.assertNotIn("generationConfig", json.loads(mocked_open.call_args.args[0].data))
+
+    def test_thinking_menu_cycles_levels_edits_values_and_resets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+            tui.data["model"] = "gemini-4-argon"
+            with patch.object(Tui, "show_cursor"):
+                tui.open_generation_settings(FakeScreen(["\r", "\x1b"]))
+                self.assertEqual(tui.data["settings"]["generation"], {"thinking_level": "low"})
+                tui.open_generation_settings(FakeScreen(["\r", "\r", "\r", "\x1b"]))  # medium, high, back to default
+                self.assertEqual(tui.data["settings"]["generation"], {})
+                with patch.object(tui, "prompt_dialog", return_value="0.3"):
+                    tui.open_generation_settings(FakeScreen([curses.KEY_DOWN, "\r", "\x1b"]))
+                self.assertEqual(tui.data["settings"]["generation"], {"temperature": 0.3})
+                tui.open_generation_settings(FakeScreen([curses.KEY_DOWN, "r", "\x1b"]))
+                self.assertEqual(tui.data["settings"]["generation"], {})
+                tui.data["settings"]["generation"] = {"seed": 5}
+                tui.open_generation_settings(FakeScreen([curses.KEY_UP] + [curses.KEY_DOWN] * 20 + ["\r", "\x1b"]))
+                self.assertEqual(tui.data["settings"]["generation"], {})
+
+    def test_mock_model_is_in_the_catalog_and_talks_to_the_local_server(self):
+        mock = MODEL_BY_ID["gemini-mock-model"]
+        self.assertTrue(mock.local_mock)
+        self.assertTrue(model_supports_terminal_tools(mock.identifier))
+        self.assertFalse(any(model.local_mock for model in MODEL_CATALOG if model is not mock))
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("real-key-should-not-leak", SessionStore(Path(directory)))
+            tui.data["model"] = "gemini-mock-model"
+            captured = {}
+
+            def fake_open(request, timeout=None):
+                captured.setdefault("url", request.full_url)
+                captured.setdefault("key", request.get_header("X-goog-api-key"))
+                if request.full_url.endswith("/gemini-mock-model"):
+                    return FakeResponse({"inputTokenLimit": 123456})
+                return FakeResponse({"candidates": [{"content": {"parts": [{"text": "mock says hi"}]}}]})
+
+            with patch.object(app, "start_mock_server") as starter, patch.object(
+                app.GOOGLE_API_OPENER, "open", side_effect=fake_open
+            ), patch.object(tui, "draw_chat"):
+                tui.data["settings"]["streaming"] = False
+                tui.handle_input(FakeScreen([]), "hello")
+            starter.assert_called_once()
+            self.assertTrue(captured["url"].startswith("http://127.0.0.1:8765/v1beta/models/gemini-mock-model:"))
+            self.assertEqual(captured["key"], "mock")
+            self.assertEqual(tui.context_limits["gemini-mock-model"], 123456)
+            self.assertEqual(tui.data["history"][-1]["content"], "mock says hi")
+            self.assertIn("mock server", tui.friendly_error(ApiError("Network error: refused"), mock))
+
+    def test_waiting_status_is_plain_with_a_dim_hint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("k", SessionStore(Path(directory)))
+            tui.status = "Waiting for gemini-4-argon...   " + app.STOP_HINT
+            drawn = []
+
+            class Recorder(FakeScreen):
+                def addstr(self_inner, row, column, text, style=0):
+                    drawn.append((text, style))
+
+            tui.draw_chat(Recorder([]))
+            self.assertEqual(app.STOP_HINT, "press esc to stop turn.")
+            texts = [text for text, _ in drawn]
+            self.assertIn("Waiting for gemini-4-argon...", texts)
+            self.assertIn("press esc to stop turn.", texts)
+            for text, style in drawn:
+                if text == "Waiting for gemini-4-argon...":
+                    self.assertFalse(style & (curses.A_BOLD | curses.A_REVERSE))
+
+    def test_header_cost_and_tokens_reset_when_context_is_cleared(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("k", SessionStore(Path(directory)))
+            tui.data["history"] = [{"role": "user", "content": "a"}, {"role": "model", "content": "b", "model_id": "m"}]
+            tui.data["usage"] = {"input": 5000, "output": 900, "cost": 0.0191, "unpriced": True}
+            self.assertTrue(tui.header_parts()[1].endswith("~$0.0191+"))
+            tui.handle_command(FakeScreen([]), "/clear")
+            rest = tui.header_parts()[1]
+            self.assertIn("0 turns", rest)
+            self.assertIn("0 in / 0 out tokens", rest)
+            self.assertTrue(rest.endswith("~$0.0000"))
+            self.assertIn("context 0/1,048,576", rest)
+            reloaded = SessionStore(Path(directory)).load()
+            self.assertEqual(reloaded["usage"], {"input": 0, "output": 0, "context": 0, "cost": 0.0, "unpriced": False})
+
+    def test_retry_only_shows_in_the_slash_menu_after_a_failed_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("k", SessionStore(Path(directory)))
+            shown = []
+
+            def run_palette():
+                class Recorder(FakeScreen):
+                    def addstr(self_inner, row, column, text, style=0):
+                        shown.append(text)
+
+                shown.clear()
+                tui.open_command_palette(Recorder(["\x1b"]))
+                return " ".join(shown)
+
+            with patch.object(Tui, "show_cursor"):
+                self.assertNotIn("/retry", run_palette())
+                tui.last_failed_prompt = "try again"
+                self.assertIn("/retry", run_palette())
+            for removed in ("/key", "/check"):
+                self.assertNotIn(removed, {command for command, _ in SLASH_COMMANDS})
+
+    def test_header_shows_context_tokens_over_the_window_left_of_the_cost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("k", SessionStore(Path(directory)))
+            tui.data["usage"] = {"input": 9000, "output": 100, "context": 4321, "cost": 0.02, "unpriced": False}
+            rest = tui.header_parts()[1]
+            self.assertIn("context 4,321/1,048,576   ~$0.0200", rest)
+            tui.context_limits[tui.model.identifier] = 200000
+            self.assertIn("context 4,321/200,000", tui.header_parts()[1])
+            tui.data["model"] = "my-custom-model"
+            self.assertIn("context 4,321   ", tui.header_parts()[1])
+
+    @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open")
+    def test_client_reads_the_input_token_limit_and_tracks_the_current_context(self, mocked_open):
+        mocked_open.return_value = FakeResponse({"name": "models/gemini-4-argon", "inputTokenLimit": 1048576})
+        client = GoogleApiClient("k")
+        self.assertEqual(client.model_input_limit("gemini-4-argon"), 1048576)
+        self.assertTrue(mocked_open.call_args.args[0].full_url.endswith("/v1beta/models/gemini-4-argon"))
+        mocked_open.return_value = FakeResponse({"candidates": [{"content": {"parts": [{"text": "a"}]}}], "usageMetadata": {"promptTokenCount": 40, "candidatesTokenCount": 1}})
+        client.generate(MODEL_BY_ID["gemini-4-argon"], [{"role": "user", "content": "Hi"}], "")
+        mocked_open.return_value = FakeResponse({"candidates": [{"content": {"parts": [{"text": "b"}]}}], "usageMetadata": {"promptTokenCount": 75, "candidatesTokenCount": 1}})
+        client.generate(MODEL_BY_ID["gemini-4-argon"], [{"role": "user", "content": "Hi"}], "")
+        self.assertEqual((client.last_prompt_tokens, client.usage_input), (75, 115))
+
+    def test_usage_updates_context_and_lifetime_totals_and_clear_keeps_lifetime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("k", SessionStore(Path(directory)))
+            client = GoogleApiClient("k")
+            client.usage_input, client.usage_output, client.last_prompt_tokens = 1_000_000, 100_000, 800
+            client.model_version = "gemini-2.5-flash"
+            tui.add_usage(client, "gemini-flash-latest")
+            client.usage_input, client.usage_output, client.last_prompt_tokens, client.model_version = 10, 5, 99, ""
+            tui.add_usage(client, "gemini-3.7-flash")
+            self.assertEqual(tui.data["usage"]["context"], 99)
+            life = tui.data["lifetime"]
+            self.assertEqual((life["input"], life["output"]), (1_000_010, 100_005))
+            self.assertTrue(life["unpriced"])
+            self.assertAlmostEqual(life["models"]["gemini-2.5-flash"]["cost"], 0.55)
+            self.assertTrue(life["models"]["gemini-3.7-flash"]["unpriced"])
+            tui.clear_context()
+            self.assertEqual(tui.data["usage"]["context"], 0)
+            self.assertEqual(tui.data["lifetime"]["input"], 1_000_010)
+            reloaded = SessionStore(Path(directory)).load()
+            self.assertEqual(reloaded["lifetime"]["input"], 1_000_010)
+            self.assertIn("gemini-2.5-flash", reloaded["lifetime"]["models"])
+
+    def test_lifetime_stats_are_sanitized_and_shown_in_the_tab_menu(self):
+        bad = SessionStore.normalize({"lifetime": {"input": -1, "output": "x", "models": {"": {}, "ok": {"input": 5}, 7: {}}}})
+        self.assertEqual(bad["lifetime"]["input"], 0)
+        self.assertEqual(list(bad["lifetime"]["models"]), ["ok"])
+        self.assertEqual(bad["lifetime"]["models"]["ok"]["input"], 5)
+        source = Path(app.__file__).read_text()
+        menu = source[source.index("def open_action_menu") : source.index("def open_settings")]
+        for item in ("Check availability", "Usage stats"):
+            self.assertIn(item, menu)
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("k", SessionStore(Path(directory)))
+            tui.data["lifetime"] = {"input": 1200, "output": 300, "cost": 0.0123, "unpriced": False,
+                                    "models": {"gemini-4-argon": {"input": 1200, "output": 300, "cost": 0.0123, "unpriced": False}}}
+            with patch.object(tui, "show_message") as show:
+                tui.show_usage_stats(FakeScreen([]))
+            text = "\n".join(show.call_args.args[2])
+            for expected in ("Tokens in:       1,200", "Tokens out:      300", "~$0.0123", "gemini-4-argon", "1,200 in / 300 out"):
+                self.assertIn(expected, text)
+
+    def test_api_key_entry_is_gone_and_context_does_not_depend_on_the_key(self):
+        source = Path(app.__file__).read_text()
+        self.assertNotIn("def configure_api_key", source)
+        self.assertNotIn("KEY_F4", source)
+        with tempfile.TemporaryDirectory() as directory:
+            first = Tui("key-one", SessionStore(Path(directory)))
+            first.data["history"] = [{"role": "user", "content": "remember me"}]
+            first.data["usage"]["context"] = 10
+            first.store.save(first.data)
+            second = Tui("key-two", SessionStore(Path(directory)))
+            self.assertEqual(second.data["history"], [{"role": "user", "content": "remember me"}])
+            self.assertEqual(second.data["usage"]["context"], 10)
+
+    def test_terminal_log_lines_are_dimmed_apart_from_the_reply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("k", SessionStore(Path(directory)))
+            tui.initialize_theme = lambda screen: None
+            tui.colors = {"muted": 111, "text": 222, "assistant": 333, "user": 444}
+            tui.data["history"] = [
+                {"role": "user", "content": "[terminal] looks like a log but is the user's"},
+                {"role": "model", "model_id": "m",
+                 "content": "[terminal] ran [READ]: ls (exit 0)\n[terminal] ran [WRITE]: mkdir x (exit 0)\n\nDone. [terminal] mentioned here"},
+            ]
+            lines = tui.render_history(80)
+            styled = {text.strip(): style for text, style in lines}
+            self.assertEqual(styled["[terminal] ran [READ]: ls (exit 0)"], 111)
+            self.assertEqual(styled["[terminal] ran [WRITE]: mkdir x (exit 0)"], 111)
+            self.assertEqual(styled["Done. [terminal] mentioned here"], 222)
+            self.assertTrue(any(text.strip().startswith("YOU  [terminal] looks like") and style != 111 for text, style in lines))
+            long_log = {"role": "model", "model_id": "m", "content": "[terminal] ran [READ]: " + "x" * 200 + " (exit 0)\n\nok"}
+            tui.data["history"] = [long_log]
+            wrapped = [style for text, style in tui.render_history(60) if text.strip() and text.strip() != "M" and text.strip() != "ok"]
+            self.assertTrue(all(style == 111 for style in wrapped[1:]))
+            self.assertEqual(Tui.split_terminal_lines("plain text"), ("", "plain text"))
+
+    def test_command_type_is_only_the_most_severe_and_common_read_tools_are_read(self):
+        review = classify_command("sw_vers && system_profiler SPHardwareDataType && df -h / && uptime")
+        self.assertEqual(review.categories, ["READ"])
+        mixed = classify_command("ls && mkdir out && mv a b")
+        self.assertEqual(mixed.primary, "WRITE")
+        source = Path(app.__file__).read_text()
+        self.assertNotIn("(also:", source)
+        unknown = classify_command("somecustomtool --go")
+        self.assertEqual(unknown.primary, "WRITE")
+        self.assertFalse(unknown.needs_confirmation)
+        self.assertIn("Unrecognized command", " ".join(unknown.notes))
 
 
 if __name__ == "__main__":

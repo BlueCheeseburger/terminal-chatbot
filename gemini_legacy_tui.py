@@ -2,10 +2,12 @@
 """A lightweight terminal chat client for Gemini models and legacy PaLM Chat."""
 
 import argparse
+import atexit
 import json
 import os
 import re
 import shlex
+import socket
 import stat
 import subprocess
 import sys
@@ -18,6 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -50,8 +53,12 @@ STREAM_RENDER_DELAY_MS = 12
 MAX_STREAM_EVENT_BYTES = 1024 * 1024
 MAX_STREAM_TEXT_CHARS = 2 * 1024 * 1024
 API_BASE_URL = "https://generativelanguage.googleapis.com"
+DEFAULT_CONTEXT_WINDOW = 1_048_576  # input tokens; replaced by the API's inputTokenLimit once known
+MOCK_PORT = 8765
+MOCK_BASE_URL = "http://127.0.0.1:{}".format(MOCK_PORT)
+MOCK_API_KEY = "mock"  # sent to the local mock server instead of your real key
 MAX_TERMINAL_RESULTS = 10
-STOP_HINT = ">>> PRESS ESC TO STOP <<<"
+STOP_HINT = "press esc to stop turn."
 TERMINAL_WARNING_RESULTS = (8, 9)
 TOOL_TIMEOUT_SECONDS = 30
 MAX_TOOL_OUTPUT_CHARS = 8000
@@ -84,6 +91,7 @@ class ModelSpec:
     protocol: str  # gemini or palm
     availability_note: str
     retired: bool = False  # shown greyed out in the picker but still selectable
+    local_mock: bool = False  # runs against tools/mock_gemini_server.py; no API key or credits needed
 
 
 @dataclass(frozen=True)
@@ -186,6 +194,7 @@ MODEL_CATALOG: Sequence[ModelSpec] = (
     ModelSpec("gemini-3-flash-preview", "Gemini 3 Flash", "Gemini Flash", "gemini", "Preview"),
     ModelSpec("gemini-2.5-flash", "Gemini 2.5 Flash", "Gemini Flash", "gemini", "Previously active users only"),
     ModelSpec("gemini-flash-latest", "Gemini Flash (latest alias)", "Gemini Flash", "gemini", "Moving alias"),
+    ModelSpec("gemini-mock-model", "Mock model (local test server)", "Testing", "gemini", "Fake replies from tools/mock_gemini_server.py on this machine; no API key or credits", False, True),
     ModelSpec("gemini-3.5-flash", "Gemini 3.5 Flash", "Unavailable", "gemini", "Not on Google's current model list; likely 404", True),
     ModelSpec("gemini-1.5-flash", "Gemini 1.5 Flash", "Unavailable", "gemini", "Legacy; shut down by Google", True),
     ModelSpec("gemini-1.5-flash-001", "Gemini 1.5 Flash 001", "Unavailable", "gemini", "Legacy; likely unavailable", True),
@@ -206,18 +215,20 @@ CUSTOM_MODEL_PICKER_ENTRY = ModelSpec(
     "Enter a public Gemini model ID manually",
 )
 DEFAULT_SYSTEM_INSTRUCTION = (
-    "You are replying inside a terminal chat interface. Use plain text only. Never use Markdown "
-    "emphasis or styling markers such as asterisks, underscores, backticks, heading hashes, block "
-    "quote markers, pipe tables, or decorative separators. Do not attempt emphasis in any form. "
-    "Blank lines between distinct blocks are allowed when they make the response easier to read."
+    "You are a helpful assistant replying inside a terminal chat window. Write plain text only: no Markdown "
+    "(no asterisks, underscores, backticks, heading hashes, quote markers, tables, or separator lines) and no emoji. "
+    "Lead with the answer, keep it short and direct, and add detail only when it helps. Separate paragraphs with a "
+    "blank line, and write lists as simple lines starting with a hyphen or a number. Put code, commands, and file "
+    "contents on their own lines indented by four spaces so they are easy to copy. If a request is ambiguous, make a "
+    "reasonable assumption and say so, or ask one brief question. If you are unsure or do not know, say so instead "
+    "of guessing."
 )
 SLASH_COMMANDS: Sequence[Tuple[str, str]] = (
     ("/clear", "Clear the shared conversation context"),
     ("/model", "Choose a model"),
-    ("/retry", "Retry the last failed prompt"),
+    ("/retry", "Retry the last failed prompt (only shown after a failed prompt)"),
+    ("/thinking", "Thinking level and other generation parameters (temperature, top P, max tokens, ...)"),
     ("/permissions", "Choose how terminal commands are approved (needs Terminal access)"),
-    ("/key", "Enter an API key for this run"),
-    ("/check", "Check model availability"),
     ("/restart", "Close and reopen the TUI"),
 )
 
@@ -259,7 +270,7 @@ def validate_model_id(value: str) -> str:
 
 def model_supports_terminal_tools(identifier: str) -> bool:
     """Terminal access is limited to gemini-flash-latest, Gemini 4 and later, and Gemini 3.8 Flash and later."""
-    if identifier == "gemini-flash-latest":
+    if identifier in ("gemini-flash-latest", "gemini-mock-model"):
         return True
     if any(token in identifier for token in ("lite", "image", "tts", "live", "embedding", "transcribe")):
         return False
@@ -366,7 +377,8 @@ READ_COMMANDS = {
     "diff", "cmp", "less", "more", "tree", "basename", "dirname", "realpath", "readlink", "cut", "tr", "awk", "jq",
     "hostname", "uptime", "lsof", "top", "true", "false", "test", "[", "man", "tldr", "ping", "dig", "nslookup",
     "sw_vers", "sysctl", "md5", "md5sum", "shasum", "sha256sum", "column", "nl", "rev", "seq", "sleep", "cd", "ifconfig",
-    "mdfind", "xxd", "hexdump", "strings",
+    "mdfind", "xxd", "hexdump", "strings", "system_profiler", "ioreg", "vm_stat", "lscpu", "free", "arch", "groups",
+    "who", "w", "last", "getconf", "mdls", "netstat", "ss", "traceroute", "host", "cal", "bc", "expr", "lsb_release",
 }
 REMOVAL_COMMANDS = {"rm", "rmdir", "unlink", "shred", "srm", "trash"}
 WRITE_COMMANDS = {
@@ -715,12 +727,220 @@ def read_api_key_file(path: Path) -> str:
     return validate_api_key(raw.decode("utf-8"))
 
 
+@dataclass(frozen=True)
+class GenerationParameter:
+    key: str  # name in the saved session
+    label: str
+    kind: str  # float, int, or list
+    minimum: float
+    maximum: float
+    description: str
+
+
+GENERATION_PARAMETERS: Sequence[GenerationParameter] = (
+    GenerationParameter("temperature", "Temperature", "float", 0.0, 2.0, "Randomness, 0 to 2. Leave unset unless you need a specific value."),
+    GenerationParameter("top_p", "Top P", "float", 0.0, 1.0, "Nucleus sampling cutoff, 0 to 1."),
+    GenerationParameter("top_k", "Top K", "int", 1, 1000, "Only sample from the K most likely tokens."),
+    GenerationParameter("max_output_tokens", "Max output tokens", "int", 1, 65536, "Hard cap on the reply length. Thinking tokens count toward it."),
+    GenerationParameter("seed", "Seed", "int", 0, 2147483647, "Fixed seed for more repeatable replies."),
+    GenerationParameter("presence_penalty", "Presence penalty", "float", -2.0, 2.0, "Discourages tokens that have already appeared. -2 to 2."),
+    GenerationParameter("frequency_penalty", "Frequency penalty", "float", -2.0, 2.0, "Discourages tokens in proportion to how often they appeared. -2 to 2."),
+    GenerationParameter("stop_sequences", "Stop sequences", "list", 0, 5, "Up to 5 comma-separated strings that end the reply when produced."),
+)
+GENERATION_PARAMETER_BY_KEY = {parameter.key: parameter for parameter in GENERATION_PARAMETERS}
+GENERATION_API_NAMES = {
+    "temperature": "temperature",
+    "top_p": "topP",
+    "top_k": "topK",
+    "max_output_tokens": "maxOutputTokens",
+    "seed": "seed",
+    "presence_penalty": "presencePenalty",
+    "frequency_penalty": "frequencyPenalty",
+}
+THINKING_LEVELS_BY_MODEL = {
+    "gemini-4-argon": ("low", "medium", "high"),
+    "gemini-3.8-flash": ("low", "medium", "high"),
+    "gemini-3.7-flash": ("low", "medium", "high"),
+    "gemini-3.6-flash": ("minimal", "low", "medium", "high"),
+    "gemini-3-flash-preview": ("minimal", "low", "medium", "high"),
+    "gemini-flash-latest": ("low", "medium", "high"),
+}
+MAX_THINKING_BUDGET = 32768
+# USD per million tokens as (last day the price applies or None, input, output); output includes thinking tokens.
+MODEL_PRICES: Dict[str, Sequence[Tuple[Optional[date], float, float]]] = {
+    "gemini-4-argon": ((date(2026, 11, 30), 2.00, 10.00), (None, 4.00, 20.00)),
+    "gemini-3.8-flash": ((date(2026, 12, 31), 0.75, 3.75), (None, 1.50, 7.50)),
+    "gemini-3.6-flash": ((date(2026, 12, 31), 0.75, 3.75), (None, 1.50, 7.50)),
+    "gemini-3-flash-preview": ((None, 0.50, 3.00),),
+    "gemini-2.5-flash": ((None, 0.30, 2.50),),
+    "gemini-mock-model": ((None, 0.0, 0.0),),
+}
+
+
+def estimate_cost(model_id: str, input_tokens: int, output_tokens: int, today: Optional[date] = None) -> Optional[float]:
+    """Estimated USD for one request, or None when the model's price is not known."""
+    prices = MODEL_PRICES.get(model_id)
+    if prices is None:
+        known = [name for name in MODEL_PRICES if model_id.startswith(name + "-")]
+        prices = MODEL_PRICES[max(known, key=len)] if known else None
+    if prices is None:
+        return None
+    today = today or date.today()
+    for last_day, input_price, output_price in prices:
+        if last_day is None or today <= last_day:
+            return (input_tokens * input_price + output_tokens * output_price) / 1_000_000
+    return None
+
+
+def thinking_support(model_id: str) -> Tuple[str, Sequence[str]]:
+    """How a model takes thinking settings: ("level", allowed levels), ("budget", ()), or ("none", ())."""
+    if model_id.startswith("gemini-2.5"):
+        return "budget", ()
+    if model_id in THINKING_LEVELS_BY_MODEL:
+        return "level", THINKING_LEVELS_BY_MODEL[model_id]
+    if model_id.startswith("gemini-"):
+        return "level", ("low", "medium", "high")
+    return "none", ()
+
+
+def parse_generation_value(key: str, text: str) -> object:
+    """Parse and range-check one generation parameter typed by the user."""
+    text = text.strip()
+    if key == "thinking_budget":
+        try:
+            value = int(text)
+        except ValueError:
+            raise ApiError("Enter a whole number: -1 for dynamic, 0 for off, or a token count.") from None
+        if not -1 <= value <= MAX_THINKING_BUDGET:
+            raise ApiError("The thinking budget must be -1 to {}.".format(MAX_THINKING_BUDGET))
+        return value
+    parameter = GENERATION_PARAMETER_BY_KEY[key]
+    if parameter.kind == "list":
+        values = [item.strip() for item in text.split(",") if item.strip()]
+        if len(values) > parameter.maximum or any(len(item) > 64 for item in values):
+            raise ApiError("Use at most 5 stop sequences of up to 64 characters.")
+        return values
+    try:
+        value = int(text) if parameter.kind == "int" else float(text)
+    except ValueError:
+        raise ApiError("Enter a {}.".format("whole number" if parameter.kind == "int" else "number")) from None
+    if value != value:
+        raise ApiError("Enter a number.")
+    if not parameter.minimum <= value <= parameter.maximum:
+        raise ApiError("{} must be between {:g} and {:g}.".format(parameter.label, parameter.minimum, parameter.maximum))
+    return value
+
+
+def normalize_generation(raw: object) -> dict:
+    """Keep only valid saved generation parameters."""
+    cleaned: dict = {}
+    if not isinstance(raw, dict):
+        return cleaned
+    for key, value in raw.items():
+        if isinstance(value, bool):
+            continue
+        try:
+            if key == "thinking_level":
+                if value in ("minimal", "low", "medium", "high"):
+                    cleaned[key] = value
+            elif key == "stop_sequences":
+                if isinstance(value, list) and all(isinstance(item, str) for item in value):
+                    parsed = parse_generation_value(key, ",".join(value))
+                    if parsed:
+                        cleaned[key] = parsed
+            elif key == "thinking_budget" or key in GENERATION_PARAMETER_BY_KEY:
+                if isinstance(value, (int, float)):
+                    cleaned[key] = parse_generation_value(key, repr(value))
+        except (ApiError, ValueError):
+            continue
+    return cleaned
+
+
+def empty_usage_totals() -> dict:
+    return {"input": 0, "output": 0, "cost": 0.0, "unpriced": False}
+
+
+def normalize_lifetime(raw: object) -> dict:
+    """All-time usage across every conversation: totals plus a per-model breakdown."""
+
+    def clean(source: object) -> dict:
+        totals = empty_usage_totals()
+        if isinstance(source, dict):
+            for name in ("input", "output"):
+                value = source.get(name)
+                if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 10**13:
+                    totals[name] = value
+            cost = source.get("cost")
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool) and 0 <= cost < 10**9:
+                totals["cost"] = float(cost)
+            totals["unpriced"] = source.get("unpriced") is True
+        return totals
+
+    lifetime = clean(raw)
+    lifetime["models"] = {}
+    models = raw.get("models") if isinstance(raw, dict) else None
+    if isinstance(models, dict):
+        for name, entry in list(models.items())[:200]:
+            if isinstance(name, str) and 0 < len(name) <= MAX_MODEL_ID_CHARS:
+                lifetime["models"][name] = clean(entry)
+    return lifetime
+
+
+def build_generation_config(generation: dict, model_id: str) -> dict:
+    """The generationConfig sent to the API: only parameters the user set, plus thinking for supporting models."""
+    config: dict = {}
+    for key, api_name in GENERATION_API_NAMES.items():
+        if key in generation:
+            config[api_name] = generation[key]
+    if generation.get("stop_sequences"):
+        config["stopSequences"] = list(generation["stop_sequences"])
+    mode, levels = thinking_support(model_id)
+    if mode == "budget" and "thinking_budget" in generation:
+        config["thinkingConfig"] = {"thinkingBudget": generation["thinking_budget"]}
+    elif mode == "level" and generation.get("thinking_level") in levels:
+        config["thinkingConfig"] = {"thinkingLevel": generation["thinking_level"].upper()}
+    return config
+
+
+def start_mock_server() -> None:
+    """Start tools/mock_gemini_server.py on the loopback port if nothing is listening there yet."""
+    address = ("127.0.0.1", MOCK_PORT)
+    with socket.socket() as probe:
+        probe.settimeout(0.3)
+        if probe.connect_ex(address) == 0:
+            return
+    script = Path(__file__).resolve().parent / "tools" / "mock_gemini_server.py"
+    if not script.is_file():
+        raise ApiError("tools/mock_gemini_server.py was not found next to the app.")
+    process = subprocess.Popen(
+        [sys.executable, str(script), "--port", str(MOCK_PORT)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
+    )
+    atexit.register(process.terminate)
+    for _ in range(30):
+        time.sleep(0.1)
+        with socket.socket() as probe:
+            probe.settimeout(0.3)
+            if probe.connect_ex(address) == 0:
+                return
+    raise ApiError("The mock server did not start. Run python3 tools/mock_gemini_server.py in another terminal.")
+
+
 class GoogleApiClient:
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str, generation: Optional[dict] = None, base_url: str = "") -> None:
         self.api_key = validate_api_key(api_key)
+        self.generation = generation or {}
+        self.base_url = base_url
         self.usage_input = 0  # prompt tokens billed by the requests this client made
         self.usage_output = 0  # response tokens, including thinking tokens
+        self.last_prompt_tokens = 0  # prompt size of the most recent request, i.e. the current context
         self.model_version = ""  # the model Google says answered (resolves aliases like gemini-flash-latest)
+
+    def _base(self) -> str:
+        return self.base_url or API_BASE_URL
 
     @staticmethod
     def _token_counts(response: dict) -> Tuple[int, int]:
@@ -736,6 +956,8 @@ class GoogleApiClient:
 
     def _note_response(self, response: dict) -> None:
         prompt_tokens, output_tokens = self._token_counts(response)
+        if prompt_tokens:
+            self.last_prompt_tokens = prompt_tokens
         self.usage_input += prompt_tokens
         self.usage_output += output_tokens
         version = response.get("modelVersion")
@@ -744,7 +966,7 @@ class GoogleApiClient:
 
     def _request(self, url: str, body: Optional[dict] = None) -> dict:
         if not self.api_key:
-            raise ApiError("No API key. Set GEMINI_API_KEY or press F4 to enter one.")
+            raise ApiError("No API key. Quit and relaunch with GEMINI_API_KEY set (or --api-key-file).")
 
         headers = {"User-Agent": USER_AGENT, "x-goog-api-key": self.api_key}
         data = None
@@ -805,8 +1027,14 @@ class GoogleApiClient:
             message += " [truncated]"
         return message
 
+    def model_input_limit(self, model_id: str) -> Optional[int]:
+        """The model's input context window in tokens, from models.get."""
+        response = self._request(self._base() + "/v1beta/models/" + urllib.parse.quote(model_id, safe=""))
+        limit = response.get("inputTokenLimit")
+        return limit if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0 else None
+
     def list_models(self) -> List[str]:
-        url = API_BASE_URL + "/v1beta/models"
+        url = self._base() + "/v1beta/models"
         response = self._request(url)
         models = response.get("models", [])
         if not isinstance(models, list):
@@ -836,23 +1064,25 @@ class GoogleApiClient:
             return answer
         return self._stream_gemini(model, history, system_instruction, on_text)
 
-    @staticmethod
-    def _gemini_body(history: Sequence[Dict[str, str]], system_instruction: str) -> dict:
+    def _gemini_body(self, history: Sequence[Dict[str, str]], system_instruction: str, model_id: str = "") -> dict:
         contents = [
             {"role": item["role"], "parts": [{"text": item["content"]}]}
             for item in history
             if item["role"] in ("user", "model") and item["content"]
         ]
-        body = {"contents": contents, "generationConfig": {"temperature": 0.7}}
+        body = {"contents": contents}
+        config = build_generation_config(self.generation, model_id)
+        if config:
+            body["generationConfig"] = config
         if system_instruction.strip():
             body["systemInstruction"] = {"parts": [{"text": system_instruction.strip()}]}
         return body
 
     def _generate_gemini(self, model: ModelSpec, history: Sequence[Dict[str, str]], system_instruction: str) -> str:
-        url = (API_BASE_URL + "/v1beta/models/{}:generateContent").format(
+        url = (self._base() + "/v1beta/models/{}:generateContent").format(
             urllib.parse.quote(model.identifier, safe="")
         )
-        response = self._request(url, self._gemini_body(history, system_instruction))
+        response = self._request(url, self._gemini_body(history, system_instruction, model.identifier))
         return self._text_from_parts(self._candidate_parts(response))
 
     @staticmethod
@@ -872,7 +1102,7 @@ class GoogleApiClient:
         text = "\n".join(
             part["text"]
             for part in parts
-            if isinstance(part, dict) and isinstance(part.get("text"), str)
+            if isinstance(part, dict) and isinstance(part.get("text"), str) and not part.get("thought")
         ).strip()
         if not text:
             raise ApiError("The selected model returned no text.")
@@ -892,10 +1122,10 @@ class GoogleApiClient:
 
         At most MAX_TERMINAL_RESULTS terminal results are fed back per turn. The results numbered
         in TERMINAL_WARNING_RESULTS (and the last one) end with a note about the accesses left."""
-        url = (API_BASE_URL + "/v1beta/models/{}:generateContent").format(
+        url = (self._base() + "/v1beta/models/{}:generateContent").format(
             urllib.parse.quote(model.identifier, safe="")
         )
-        body = self._gemini_body(history, system_instruction)
+        body = self._gemini_body(history, system_instruction, model.identifier)
         body["tools"] = [TERMINAL_TOOL]
         log: List[str] = []
         used = 0
@@ -954,8 +1184,8 @@ class GoogleApiClient:
         on_text: Callable[[str], None],
     ) -> str:
         if not self.api_key:
-            raise ApiError("No API key. Set GEMINI_API_KEY or press F4 to enter one.")
-        url = (API_BASE_URL + "/v1beta/models/{}:streamGenerateContent?alt=sse").format(
+            raise ApiError("No API key. Quit and relaunch with GEMINI_API_KEY set (or --api-key-file).")
+        url = (self._base() + "/v1beta/models/{}:streamGenerateContent?alt=sse").format(
             urllib.parse.quote(model.identifier, safe="")
         )
         headers = {
@@ -964,7 +1194,7 @@ class GoogleApiClient:
             "Accept": "text/event-stream",
             "x-goog-api-key": self.api_key,
         }
-        request_data = json.dumps(self._gemini_body(history, system_instruction)).encode("utf-8")
+        request_data = json.dumps(self._gemini_body(history, system_instruction, model.identifier)).encode("utf-8")
         if len(request_data) > MAX_API_REQUEST_BYTES:
             raise ApiError("Conversation context exceeded the request safety limit. Use /clear and try again.")
         request = urllib.request.Request(url, data=request_data, headers=headers, method="POST")
@@ -1003,7 +1233,7 @@ class GoogleApiClient:
                     chunk = "".join(
                         part["text"]
                         for part in parts
-                        if isinstance(part, dict) and isinstance(part.get("text"), str)
+                        if isinstance(part, dict) and isinstance(part.get("text"), str) and not part.get("thought")
                     )
                     if chunk:
                         received_chars += len(chunk)
@@ -1021,6 +1251,8 @@ class GoogleApiClient:
             raise ApiError("Network error: {}".format(error)) from error
         self.usage_input += latest_usage[0]
         self.usage_output += latest_usage[1]
+        if latest_usage[0]:
+            self.last_prompt_tokens = latest_usage[0]
         text = "".join(received).strip()
         if not text:
             raise ApiError("The selected model returned no text.")
@@ -1029,7 +1261,7 @@ class GoogleApiClient:
     def _generate_palm(self, model: ModelSpec, history: Sequence[Dict[str, str]], system_instruction: str) -> str:
         # PaLM Chat used a different, now-retired API shape. Keeping this request
         # lets accounts with an available legacy endpoint attempt the original model.
-        url = (API_BASE_URL + "/v1beta3/models/{}:generateMessage").format(
+        url = (self._base() + "/v1beta3/models/{}:generateMessage").format(
             urllib.parse.quote(model.identifier, safe="")
         )
         messages = [
@@ -1124,12 +1356,16 @@ class SessionStore:
                     normalized["model_id"] = model_id
                 history.append(normalized)
         raw_usage = data.get("usage")
-        usage = {"input": 0, "output": 0}
+        usage = {"input": 0, "output": 0, "context": 0, "cost": 0.0, "unpriced": False}
         if isinstance(raw_usage, dict):
-            for name in usage:
+            for name in ("input", "output", "context"):
                 value = raw_usage.get(name)
                 if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 10**12:
                     usage[name] = value
+            cost = raw_usage.get("cost")
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool) and 0 <= cost < 10**9:
+                usage["cost"] = float(cost)
+            usage["unpriced"] = raw_usage.get("unpriced") is True
         settings = data.get("settings", {})
         streaming = settings.get("streaming", True) if isinstance(settings, dict) else True
         terminal_tools = settings.get("terminal_tools", False) if isinstance(settings, dict) else False
@@ -1151,8 +1387,10 @@ class SessionStore:
             "system_instruction": system_instruction,
             "history": history,
             "usage": usage,
+            "lifetime": normalize_lifetime(data.get("lifetime")),
             "settings": {
                 "streaming": streaming if isinstance(streaming, bool) else True,
+                "generation": normalize_generation(settings.get("generation") if isinstance(settings, dict) else None),
                 "terminal_tools": terminal_tools if isinstance(terminal_tools, bool) else False,
                 "system_instruction_configured": system_instruction_configured,
                 "theme": theme,
@@ -1205,7 +1443,9 @@ class Tui:
             self.data["model"] = DEFAULT_MODEL_ID
         if not isinstance(self.data.get("settings"), dict):
             self.data["settings"] = {}
-        self.data.setdefault("usage", {"input": 0, "output": 0})
+        self.data.setdefault("usage", {"input": 0, "output": 0, "context": 0, "cost": 0.0, "unpriced": False})
+        self.data.setdefault("lifetime", normalize_lifetime(None))
+        self.data["settings"].setdefault("generation", {})
         self.data["settings"].setdefault("streaming", True)
         self.data["settings"].setdefault("terminal_tools", False)
         self.data["settings"].setdefault("system_instruction_configured", False)
@@ -1213,7 +1453,7 @@ class Tui:
         for item in self.data["history"]:
             if item["role"] == "model":
                 item["content"] = self.plain_terminal_response(item["content"])
-        self.status = "Ready" if self.api_key else "No API key. Press F4 or open Settings from the Tab menu to enter one."
+        self.status = "Ready" if self.api_key else "No API key. Quit and relaunch with GEMINI_API_KEY set or --api-key-file. The mock model works without one."
         self.input_rows = 1
         self.available_models: Optional[set] = None
         self.running = True
@@ -1224,6 +1464,7 @@ class Tui:
             item["content"] for item in self.data["history"] if item["role"] == "user"
         ]
         self.last_failed_prompt: Optional[str] = None
+        self.context_limits: Dict[str, int] = {}
         self.command_permissions = "ask"  # ask, safe, or all; resets on restart
         self.stop_requested = False
 
@@ -1275,24 +1516,42 @@ class Tui:
         start = max(end - window_height, 0)
         return list(lines[start:end]), normalized_offset, maximum_offset
 
+    @staticmethod
+    def split_terminal_lines(content: str) -> Tuple[str, str]:
+        """Separate the leading "[terminal] ..." log lines of a reply from the reply text itself."""
+        lines = content.split("\n")
+        count = 0
+        while count < len(lines) and lines[count].startswith("[terminal]"):
+            count += 1
+        return "\n".join(lines[:count]), "\n".join(lines[count:]).lstrip("\n")
+
     def render_history(self, width: int, compact: bool = False) -> List[Tuple[str, int]]:
         lines: List[Tuple[str, int]] = []
         content_width = max(width - (5 if compact else 8), 8)
+        indent = "   " if compact else "       "
         for item in self.data["history"]:
             is_user = item["role"] == "user"
             label = "YOU" if is_user else item.get("model_id", "UNKNOWN MODEL").upper()
             role_style = self.style("user" if is_user else "assistant", curses.A_BOLD)
-            wrapped = self.wrap_content(item["content"], content_width)
+            terminal_text, reply_text = ("", item["content"]) if is_user else self.split_terminal_lines(item["content"])
+            # Terminal results are dimmed so they read differently from the model's own words.
+            body: List[Tuple[str, int]] = []
+            if terminal_text:
+                body.extend((line, self.style("muted")) for line in self.wrap_content(terminal_text, content_width))
+                if reply_text:
+                    body.append(("", 0))
+            if reply_text or not terminal_text:
+                body.extend((line, self.style("text")) for line in self.wrap_content(reply_text, content_width))
             if compact:
                 compact_label = "You" if is_user else item.get("model_id", "Unknown model")
-                lines.append((compact_label + ": " + wrapped[0], role_style))
-                lines.extend(("   " + line, self.style("text")) for line in wrapped[1:])
+                lines.append((compact_label + ": " + body[0][0], role_style if is_user else body[0][1]))
+                lines.extend((indent + line, style) for line, style in body[1:])
             elif is_user:
-                lines.append(("  YOU  " + wrapped[0], role_style))
-                lines.extend(("       " + line, self.style("text")) for line in wrapped[1:])
+                lines.append(("  YOU  " + body[0][0], role_style))
+                lines.extend((indent + line, style) for line, style in body[1:])
             else:
                 lines.append(("  " + label, role_style))
-                lines.extend(("       " + line, self.style("text")) for line in wrapped)
+                lines.extend((indent + line, style) for line, style in body)
             lines.append(("", 0))
         return lines
 
@@ -1334,15 +1593,44 @@ class Tui:
     def format_tokens(value: int) -> str:
         return "{:,}".format(value)
 
+    def context_window(self) -> Optional[int]:
+        identifier = self.model.identifier
+        if identifier in self.context_limits:
+            return self.context_limits[identifier]
+        return DEFAULT_CONTEXT_WINDOW if identifier.startswith("gemini-") else None
+
+    def learn_context_window(self, client: "GoogleApiClient", model: ModelSpec) -> None:
+        if model.protocol != "gemini" or model.identifier in self.context_limits:
+            return
+        try:
+            limit = client.model_input_limit(model.identifier)
+        except ApiError:
+            return
+        if limit:
+            self.context_limits[model.identifier] = limit
+
+    @staticmethod
+    def format_cost(usage: dict) -> str:
+        """Estimated spend; a trailing + means some usage came from a model with no known price."""
+        cost = usage.get("cost", 0.0)
+        if cost == 0 and usage.get("unpriced"):
+            return "cost unknown"
+        text = "~${:.4f}".format(cost) if cost < 0.1 else "~${:.2f}".format(cost)
+        return text + ("+" if usage.get("unpriced") else "")
+
     def header_parts(self) -> Tuple[str, str]:
         """The one-line header: (model id, the rest)."""
         turns = sum(1 for item in self.data["history"] if item["role"] == "user")
         usage = self.data["usage"]
-        rest = "   {} turn{}   {} in / {} out tokens".format(
+        window = self.context_window()
+        context = self.format_tokens(usage.get("context", 0)) + ("/" + self.format_tokens(window) if window else "")
+        rest = "   {} turn{}   {} in / {} out tokens   context {}   {}".format(
             turns,
             "" if turns == 1 else "s",
             self.format_tokens(usage["input"]),
             self.format_tokens(usage["output"]),
+            context,
+            self.format_cost(usage),
         )
         return self.model.identifier, rest
 
@@ -1381,8 +1669,16 @@ class Tui:
         for row, (line, style) in enumerate(visible, start=2):
             self.add(screen, row, 0, line[: max(width - 1, 0)], style)
         self.add(screen, upper_border, 0, "-" * max(width - 1, 0), self.style("border"))
-        for index, line in enumerate(self.status_lines(width), start=upper_border + 1):
-            self.add(screen, index, 1, line, self.status_style())
+        if self.status.endswith(STOP_HINT):
+            main = self.status[: -len(STOP_HINT)].rstrip()
+            room = max(width - len(STOP_HINT) - 7, 10)
+            if len(main) > room:
+                main = main[: room - 1] + "..."
+            self.add(screen, upper_border + 1, 1, main, self.style("text"))
+            self.add(screen, upper_border + 1, 4 + len(main), STOP_HINT, self.style("muted"))
+        else:
+            for index, line in enumerate(self.status_lines(width), start=upper_border + 1):
+                self.add(screen, index, 1, line, self.status_style())
         self.add(screen, lower_border, 0, "-" * max(width - 1, 0), self.style("border"))
         self.add(screen, input_top, 1, ">", self.style("accent", curses.A_BOLD))
         if self.scroll_offset:
@@ -1500,9 +1796,6 @@ class Tui:
             if key == curses.KEY_F3:
                 self.edit_system_instruction(screen)
                 return None
-            if key == curses.KEY_F4:
-                self.configure_api_key(screen)
-                return None
             if key == curses.KEY_F5:
                 self.check_availability(screen)
                 return None
@@ -1590,14 +1883,20 @@ class Tui:
         self.store.save(self.data)
         use_tools = self.terminal_tools_active
         self.stop_requested = False
-        client = GoogleApiClient(self.api_key)
+        generation = self.data["settings"].get("generation", {})
+        if selected_model.local_mock:
+            client = GoogleApiClient(MOCK_API_KEY, generation, MOCK_BASE_URL)
+        else:
+            client = GoogleApiClient(self.api_key, generation)
         if use_tools:
-            self.status = "{}   Waiting for {}...".format(STOP_HINT, selected_model.identifier)
+            self.status = "Waiting for {}...   {}".format(selected_model.identifier, STOP_HINT)
         elif self.streaming_enabled:
             self.status = "Streaming {}...".format(selected_model.identifier)
         else:
             self.status = "Waiting for {}...".format(selected_model.identifier)
         try:
+            if selected_model.local_mock:
+                start_mock_server()
             if use_tools:
                 self.draw_chat(screen)
                 answer, tool_log = client.generate_with_tools(
@@ -1649,6 +1948,7 @@ class Tui:
                 )
             self.status = "Response complete."
             self.last_failed_prompt = None
+            self.learn_context_window(client, selected_model)
         except ApiError as error:
             if self.data["history"] and self.data["history"][-1].get("role") == "model":
                 self.data["history"].pop()
@@ -1659,13 +1959,27 @@ class Tui:
                 self.friendly_error(error, selected_model)
             )
         finally:
-            self.add_usage(client)
+            self.add_usage(client, selected_model.identifier)
         self.store.save(self.data)
 
-    def add_usage(self, client: "GoogleApiClient") -> None:
+    def add_usage(self, client: "GoogleApiClient", model_id: str = "") -> None:
+        if not (client.usage_input or client.usage_output):
+            return
+        name = client.model_version or model_id
+        cost = estimate_cost(name, client.usage_input, client.usage_output)
         usage = self.data["usage"]
-        usage["input"] += client.usage_input
-        usage["output"] += client.usage_output
+        if client.last_prompt_tokens:
+            usage["context"] = client.last_prompt_tokens
+        lifetime = self.data["lifetime"]
+        per_model = lifetime["models"].setdefault(name[:MAX_MODEL_ID_CHARS] or "unknown", empty_usage_totals())
+        # The conversation totals reset on /clear; the lifetime totals never do.
+        for totals in (usage, lifetime, per_model):
+            totals["input"] += client.usage_input
+            totals["output"] += client.usage_output
+            if cost is None:
+                totals["unpriced"] = True
+            else:
+                totals["cost"] += cost
 
     def poll_stop_request(self, screen: "curses._CursesWindow", running: str = "") -> bool:
         """Non-blocking check for Esc while a terminal turn is in progress. Other keys are discarded."""
@@ -1689,9 +2003,14 @@ class Tui:
 
     def terminal_system_instruction(self) -> str:
         note = (
-            "You can run shell commands on the user's computer with the {} tool. The user may deny a command "
-            "or stop the turn; do not retry a denied command. Platform: {}. Working directory: {}. Use non-interactive commands, "
-            "keep output small, and explain what you did in plain text. You get at most {limit} terminal results per turn."
+            "You can run shell commands on the user's computer with the {} tool. The user may deny a command or "
+            "stop the turn; if a command is denied, do not retry it and ask how to proceed. Platform: {}. Working "
+            "directory: {}. Run one purposeful command at a time and inspect with read-only commands before changing "
+            "anything. Use non-interactive commands with small output (head, grep, or counts instead of dumping whole "
+            "files); if output ends with a truncation note, narrow the command instead of guessing. Do not use sudo, "
+            "delete files, or touch anything outside the working directory unless the user asked for it. You get at "
+            "most {limit} terminal results per turn. When you finish, summarize what happened in plain text and do not "
+            "claim success unless the output shows it."
         ).format(TERMINAL_TOOL_NAME, sys.platform, Path.cwd(), limit=MAX_TERMINAL_RESULTS)
         base = self.data.get("system_instruction", "").strip()
         return (base + "\n\n" + note) if base else note
@@ -1714,7 +2033,7 @@ class Tui:
                     {"error": "The user denied this command. Do not retry it; ask the user how to proceed."},
                     "[terminal] denied [{}]: {}".format(review.primary, shown),
                 )
-        self.status = "{}   Running: {}".format(STOP_HINT, shown)
+        self.status = "Running: {}   {}".format(shown, STOP_HINT)
         self.draw_chat(screen)
         result = run_shell_command(command, should_stop=lambda: self.poll_stop_request(screen))
         if "error" in result:
@@ -1749,8 +2068,6 @@ class Tui:
             "REMOVAL": self.style("error"),
         }
         type_line = "Type: {}".format(review.primary)
-        if len(review.categories) > 1:
-            type_line += "   (also: {})".format(", ".join(review.categories[:-1][::-1]))
         extra: List[Tuple[str, int]] = []
         for reason in review.risks:
             for wrapped in textwrap.wrap("RISKY: " + reason, inner) or [""]:
@@ -1787,15 +2104,17 @@ class Tui:
 
     def friendly_error(self, error: ApiError, model: ModelSpec) -> str:
         raw = str(error)
+        if model.local_mock and raw.startswith("Network error"):
+            return "Could not reach the mock server on 127.0.0.1:{}. Run python3 tools/mock_gemini_server.py in another terminal.".format(MOCK_PORT)
         if raw.startswith("HTTP 429:") and "quota" in raw.lower():
             return "Quota unavailable for {}. Check plan/billing or choose another model.".format(model.identifier)
         if raw.startswith("HTTP 404:") and ("not found" in raw.lower() or "not supported" in raw.lower()):
-            return "{} is unavailable for this API key or endpoint. Choose another model with Ctrl+L.".format(model.identifier)
+            return "{} is unavailable for this API key or endpoint. Choose another model with /model.".format(model.identifier)
         return raw
 
     def clear_context(self) -> None:
         self.data["history"] = []
-        self.data["usage"] = {"input": 0, "output": 0}
+        self.data["usage"] = {"input": 0, "output": 0, "context": 0, "cost": 0.0, "unpriced": False}
         self.scroll_offset = 0
         self.store.save(self.data)
         self.status = "Context cleared."
@@ -1820,24 +2139,23 @@ class Tui:
             self.select_model(screen)
         elif command == "/retry":
             self.retry_last(screen)
+        elif command == "/thinking":
+            self.open_generation_settings(screen)
         elif command == "/permissions":
             if self.terminal_tools_setting:
                 self.select_command_permissions(screen)
             else:
                 self.status = "Turn on Terminal access in Settings to use /permissions."
-        elif command == "/key":
-            self.configure_api_key(screen)
-        elif command == "/check":
-            self.check_availability(screen)
         else:
             self.status = "Unknown command. Type / to see the commands."
 
     def open_action_menu(self, screen: "curses._CursesWindow") -> None:
         actions = (
-            ("Settings", "Themes, streaming, system instruction, API key, and availability", "settings"),
+            ("Settings", "Streaming, terminal access, themes, and system instruction", "settings"),
             ("View transcript", "Read the complete rewrapped conversation", "transcript"),
-            ("Clear context", "Remove the shared conversation history", "clear"),
+            ("Check availability", "See which catalog models this API key can use", "check"),
             ("Help", "Show shortcuts and slash commands", "help"),
+            ("Usage stats", "All-time tokens, estimated cost, and models used", "stats"),
             ("Exit", "Close Gemini Legacy", "exit"),
         )
         selected = 0
@@ -1875,12 +2193,14 @@ class Tui:
             if key not in ("\n", "\r"):
                 continue
             action = actions[selected][2]
-            if action == "clear":
-                self.clear_context()
-            elif action == "settings":
+            if action == "settings":
                 self.open_settings(screen)
             elif action == "transcript":
                 self.show_transcript(screen)
+            elif action == "check":
+                self.check_availability(screen)
+            elif action == "stats":
+                self.show_usage_stats(screen)
             elif action == "help":
                 self.show_help(screen)
             elif action == "exit":
@@ -1895,8 +2215,6 @@ class Tui:
             ("Terminal access", "Let supported models run shell commands (you approve each)", "tools"),
             ("Theme", "Choose the terminal color palette", "theme"),
             ("System instruction", "Set or clear the instruction for this chat", "system"),
-            ("API key", "Enter an API key for this run only", "key"),
-            ("Model availability", "Check models visible to this API key", "check"),
             ("Back", "Return to chat", "back"),
         )
         try:
@@ -1977,10 +2295,6 @@ class Tui:
                 self.select_theme(screen)
             elif action == "system":
                 self.edit_system_instruction(screen)
-            elif action == "key":
-                self.configure_api_key(screen)
-            elif action == "check":
-                self.check_availability(screen)
             elif action == "back":
                 break
         self.show_cursor()
@@ -2057,6 +2371,7 @@ class Tui:
                 command
                 for command in SLASH_COMMANDS
                 if (command[0] != "/permissions" or self.terminal_tools_setting)
+                and (command[0] != "/retry" or self.last_failed_prompt)
                 and query.lower() in "{} {}".format(command[0], command[1]).lower()
             ]
             if matches and selected_command not in {command[0] for command in matches}:
@@ -2372,6 +2687,101 @@ class Tui:
             if (isinstance(key, str) and key.lower() == "n") or self.is_cancel_key(key):
                 return False
 
+    def open_generation_settings(self, screen: "curses._CursesWindow") -> None:
+        """/thinking: thinking level plus the other generation parameters the API accepts."""
+        selected = 0
+        message = ""
+        while True:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+            generation = self.data["settings"].setdefault("generation", {})
+            mode, levels = thinking_support(self.model.identifier)
+            rows: List[Tuple[str, str, str, str]] = []
+            if mode == "level":
+                level = generation.get("thinking_level")
+                value = level or "default"
+                if level and level not in levels:
+                    value += "   (not supported by {}; ignored)".format(self.model.identifier)
+                rows.append(("thinking_level", "Thinking level", value, "How much the model reasons before answering. This model accepts: {}.".format(", ".join(levels))))
+            elif mode == "budget":
+                budget = generation.get("thinking_budget")
+                value = "default" if budget is None else "dynamic" if budget == -1 else "off" if budget == 0 else "{} tokens".format(budget)
+                rows.append(("thinking_budget", "Thinking budget", value, "Tokens the model may spend thinking: -1 dynamic, 0 off, up to {}.".format(MAX_THINKING_BUDGET)))
+            else:
+                rows.append(("thinking_none", "Thinking", "not supported by this model", "Choose a Gemini model with /model to set thinking."))
+            for parameter in GENERATION_PARAMETERS:
+                raw = generation.get(parameter.key)
+                value = "default" if raw is None else ", ".join(raw) if parameter.kind == "list" else str(raw)
+                rows.append((parameter.key, parameter.label, value, parameter.description))
+            rows.append(("reset", "Reset all to defaults", "", "Clear every value above so the model's own defaults apply."))
+            selected = min(selected, len(rows) - 1)
+            screen.erase()
+            height, width = screen.getmaxyx()
+            self.add(screen, 0, 0, " " * max(width - 1, 0), self.style("header"))
+            self.add(screen, 0, 1, "THINKING AND GENERATION SETTINGS", self.style("header", curses.A_BOLD))
+            self.add(screen, 2, 2, "Applies to {}. Only values you set are sent; the rest use the model's defaults.".format(self.model.identifier)[: width - 4], self.style("muted"))
+            self.add(screen, 3, 0, "-" * max(width - 1, 0), self.style("border"))
+            visible = max((height - 8) // 2, 1)
+            offset = min(max(selected - visible + 1, 0), max(len(rows) - visible, 0))
+            for displayed, index in enumerate(range(offset, min(offset + visible, len(rows)))):
+                key, label, value, description = rows[index]
+                row = 5 + displayed * 2
+                style = self.style("selected") if index == selected else self.style("text")
+                self.add(screen, row, 2, "{}  {: <22} {}".format(">" if index == selected else " ", label, value)[: width - 4], style)
+                self.add(screen, row + 1, 5, description[: width - 7], self.style("muted"))
+            if message:
+                self.add(screen, height - 2, 2, message[: width - 4], self.style("warning"))
+            self.add(screen, height - 1, 2, "Up/Down select   Enter change   R reset this one   Esc back"[: width - 4], self.style("footer"))
+            screen.refresh()
+            key = screen.get_wch()
+            message = ""
+            if self.is_cancel_key(key) or key in ("q", "Q"):
+                break
+            if key in (curses.KEY_UP, "k"):
+                selected = max(0, selected - 1)
+                continue
+            if key in (curses.KEY_DOWN, "j"):
+                selected = min(len(rows) - 1, selected + 1)
+                continue
+            name = rows[selected][0]
+            if key in ("r", "R") and name not in ("reset", "thinking_none"):
+                generation.pop(name, None)
+            elif key in ("\n", "\r", " "):
+                if name == "reset":
+                    generation.clear()
+                elif name == "thinking_level":
+                    options = [None, *levels]
+                    current = generation.get("thinking_level")
+                    following = options[(options.index(current) + 1) % len(options)] if current in options else options[1]
+                    if following is None:
+                        generation.pop("thinking_level", None)
+                    else:
+                        generation["thinking_level"] = following
+                elif name != "thinking_none":
+                    parameter = GENERATION_PARAMETER_BY_KEY.get(name)
+                    label = parameter.label if parameter else "Thinking budget"
+                    current = generation.get(name)
+                    initial = "" if current is None else ", ".join(current) if isinstance(current, list) else str(current)
+                    typed = self.prompt_dialog(screen, "{} (blank = default)".format(label), initial, max_length=96)
+                    if typed is None:
+                        continue
+                    if not typed:
+                        generation.pop(name, None)
+                    else:
+                        try:
+                            generation[name] = parse_generation_value(name, typed)
+                        except ApiError as error:
+                            message = str(error)
+                            continue
+                    if generation.get(name) == []:
+                        generation.pop(name, None)
+            else:
+                continue
+            self.store.save(self.data)
+        self.show_cursor()
+
     def select_command_permissions(self, screen: "curses._CursesWindow") -> None:
         options = (
             ("ask", "Ask approval each time", "Every command shows a dialog and waits for Y or N."),
@@ -2434,24 +2844,6 @@ class Tui:
             self.data["settings"]["system_instruction_configured"] = True
             self.store.save(self.data)
             self.status = "System instruction {}.".format("updated" if value else "cleared")
-
-    def configure_api_key(self, screen: "curses._CursesWindow") -> None:
-        value = self.prompt_dialog(
-            screen,
-            "API key (kept only for this run)",
-            "",
-            secret=True,
-            max_length=MAX_API_KEY_CHARS,
-        )
-        if value:
-            try:
-                self.api_key = validate_api_key(value)
-                self.available_models = None
-                self.status = "API key updated for this session."
-            except ApiError as error:
-                self.status = str(error)
-        elif value == "":
-            self.status = "API key was unchanged."
 
     def prompt_dialog(
         self,
@@ -2518,11 +2910,34 @@ class Tui:
                 "Tab opens the main menu (settings, help, transcript, exit). Type / for the searchable command palette.",
                 "Enter sends; Shift+Enter adds a new line (see the README for terminal setup). Up/Down or Page Up/Page Down scroll the chat. Ctrl+P/Ctrl+O recall submitted prompts.",
                 "F6 opens the complete conversation reader with Up/Down scrolling.",
-                "Settings contains streaming, terminal access, themes, system instruction, API key, and model availability.",
-                "/clear erases context; /retry repeats a failed prompt; /restart reopens the UI; /permissions sets terminal approval (when Terminal access is on).",
-                "API keys are never written to disk. Transcripts live in the selected state folder.",
+                "Settings contains streaming, terminal access, themes, and the system instruction. The Tab menu also has availability checks and all-time usage stats.",
+                "/clear erases context; /retry repeats a failed prompt; /restart reopens the UI; /thinking sets thinking and generation parameters; /permissions sets terminal approval (when Terminal access is on).",
+                "The API key comes from GEMINI_API_KEY or --api-key-file when you launch, and is never written to disk. Transcripts live in the selected state folder.",
             ],
         )
+
+    def show_usage_stats(self, screen: "curses._CursesWindow") -> None:
+        lifetime = self.data["lifetime"]
+        lines = [
+            "All-time usage across every conversation (/clear does not reset this)",
+            "",
+            "  Tokens in:       {}".format(self.format_tokens(lifetime["input"])),
+            "  Tokens out:      {}".format(self.format_tokens(lifetime["output"])),
+            "  Estimated cost:  {}".format(self.format_cost(lifetime)),
+            "",
+            "Models used",
+        ]
+        models = sorted(lifetime["models"].items(), key=lambda item: item[1]["input"] + item[1]["output"], reverse=True)
+        for name, totals in models:
+            lines.append(
+                "  {}   {} in / {} out   {}".format(
+                    name, self.format_tokens(totals["input"]), self.format_tokens(totals["output"]), self.format_cost(totals)
+                )
+            )
+        if not models:
+            lines.append("  none yet")
+        lines += ["", "Costs are estimates from Google's published prices; a trailing + means some usage had no known price."]
+        self.show_message(screen, "Usage stats", lines)
 
     def show_transcript(self, screen: "curses._CursesWindow") -> None:
         self.show_message(screen, "Complete transcript", self.transcript_lines())
@@ -2674,8 +3089,6 @@ class Tui:
         return self.colors.get(name, 0) | extra
 
     def status_style(self) -> int:
-        if STOP_HINT in self.status:
-            return self.style("warning", curses.A_BOLD | curses.A_REVERSE)
         lowered = self.status.lower()
         if any(token in lowered for token in ("http", "error", "no api key", "network", "invalid", "timed out")):
             return self.style("error", curses.A_BOLD)
