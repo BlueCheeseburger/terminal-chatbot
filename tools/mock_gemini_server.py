@@ -6,6 +6,9 @@ Run it, then start the app against it:
     python3 tools/mock_gemini_server.py
     GEMINI_API_KEY=mock python3 gemini_legacy_tui.py --api-base-url http://127.0.0.1:8765
 
+To try the LM Studio provider without LM Studio, launch the app with --lmstudio-url http://127.0.0.1:8765
+and pick one of the "mock-" models under LM Studio (local) in /model.
+
 Type "run <command>" (for example "run ls -la" or "run rm notes.txt") to make the fake model
 ask to run that command through the terminal tool. Anything else gets an echo reply.
 """
@@ -69,6 +72,21 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_GET(self):
+        # LM Studio's local server (OpenAI-compatible); it does not use a Google key.
+        if self.path.startswith("/api/v1/models"):
+            return self.send_json({"models": [
+                {"type": "llm", "key": "mock-llama-3", "max_context_length": 32768,
+                 "loaded_instances": [{"id": "mock-llama-3", "config": {"context_length": 8192}}]},
+                {"type": "llm", "key": "qwen/mock-think", "max_context_length": 32768, "loaded_instances": []},
+                {"type": "llm", "key": "mock-nosystem", "max_context_length": 4096, "loaded_instances": []},
+                {"type": "llm", "key": "mock-harmony", "max_context_length": 4096, "loaded_instances": []},
+                {"type": "embedding", "key": "text-embedding-mock", "max_context_length": 2048, "loaded_instances": []},
+            ]})
+        if self.path.startswith("/v1/models"):
+            names = ["mock-llama-3", "qwen/mock-think", "mock-nosystem", "mock-harmony", "text-embedding-mock"]
+            return self.send_json({"data": [{"id": name, "object": "model"} for name in names]})
+        if self.path.startswith("/api/v0/models/"):
+            return self.send_json({"id": self.path.split("/api/v0/models/")[-1], "loaded_context_length": 8192, "max_context_length": 32768})
         if not self.headers.get("x-goog-api-key"):
             return self.send_json({"error": {"message": "missing key"}}, 401)
         if "/models/" in self.path:
@@ -77,10 +95,39 @@ class Handler(BaseHTTPRequestHandler):
         names = ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-latest"]
         self.send_json({"models": [{"name": "models/" + name} for name in names]})
 
+    def lmstudio_chat(self, body):
+        model = body.get("model", "mock-llama-3")
+        if model == "mock-nosystem" and any(m.get("role") == "system" for m in body.get("messages", [])):
+            return self.send_json({"error": "Only user and assistant roles are supported!"}, 400)
+        messages = [m for m in body.get("messages", []) if m.get("role") == "user"]
+        text = messages[-1].get("content", "") if messages else ""
+        extras = {key: body[key] for key in ("temperature", "top_p", "top_k", "max_tokens", "seed", "stop") if key in body}
+        suffix = "  [params: {}]".format(json.dumps(extras, sort_keys=True)) if extras else ""
+        reply = "Mock LM Studio reply to: {}{}".format(text, suffix)
+        if "think" in model:
+            reply = "<think>pondering the question</think>" + reply
+        if model == "mock-harmony":
+            reply = "<|channel|>analysis<|message|>hmm<|end|><|start|>assistant<|channel|>final<|message|>" + reply + "<|return|>"
+        usage = {"prompt_tokens": 20, "completion_tokens": 9, "total_tokens": 29}
+        if body.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for i in range(0, len(reply), 7):
+                event = {"model": model, "choices": [{"index": 0, "delta": {"content": reply[i : i + 7]}}]}
+                self.wfile.write(("data: " + json.dumps(event) + "\n\n").encode("utf-8"))
+            final = {"model": model, "choices": [], "usage": usage}
+            self.wfile.write(("data: " + json.dumps(final) + "\n\ndata: [DONE]\n\n").encode("utf-8"))
+            self.wfile.flush()
+            return
+        self.send_json({"model": model, "choices": [{"index": 0, "message": {"role": "assistant", "content": reply}}], "usage": usage})
+
     def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if self.path.startswith("/v1/chat/completions"):
+            return self.lmstudio_chat(json.loads(self.rfile.read(length) or b"{}"))
         if not self.headers.get("x-goog-api-key"):
             return self.send_json({"error": {"message": "missing key"}}, 401)
-        length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(length) or b"{}")
         reply = build_reply(body)
         model = self.path.split("/models/")[-1].split(":")[0]

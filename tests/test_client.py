@@ -24,8 +24,14 @@ from gemini_legacy_tui import (
     THEMES,
     NoRedirectHandler,
     SLASH_COMMANDS,
+    LMSTUDIO_OFFLINE_ENTRY,
+    LMStudioClient,
     SessionStore,
     Tui,
+    display_model_name,
+    lmstudio_model_spec,
+    validate_lmstudio_url,
+    visible_reasoning_free,
     build_generation_config,
     estimate_cost,
     parse_generation_value,
@@ -1152,6 +1158,338 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(unknown.primary, "WRITE")
         self.assertFalse(unknown.needs_confirmation)
         self.assertIn("Unrecognized command", " ".join(unknown.notes))
+
+    def test_lmstudio_model_ids_are_accepted_and_survive_a_session_reload(self):
+        self.assertEqual(validate_model_id("lmstudio:qwen/qwen3-8b@q4_k_m"), "lmstudio:qwen/qwen3-8b@q4_k_m")
+        with self.assertRaises(ApiError):
+            validate_model_id("qwen/qwen3-8b")  # slashes only belong to LM Studio IDs
+        self.assertEqual(SessionStore.normalize({"model": "lmstudio:meta/llama-3"})["model"], "lmstudio:meta/llama-3")
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+            tui.data["model"] = "lmstudio:meta/llama-3"
+            spec = tui.model
+            self.assertEqual((spec.protocol, spec.label), ("lmstudio", "meta/llama-3"))
+            self.assertFalse(model_supports_terminal_tools(spec.identifier))
+            self.assertEqual(thinking_support(spec.identifier)[0], "none")
+            self.assertEqual(estimate_cost(spec.identifier, 1000, 1000), 0.0)
+            self.assertEqual(display_model_name(spec.identifier), "meta/llama-3 (LM Studio)")
+            self.assertEqual(display_model_name("gemini-4-argon"), "gemini-4-argon")
+
+    def test_lmstudio_url_is_validated(self):
+        self.assertEqual(validate_lmstudio_url("http://127.0.0.1:1234/"), "http://127.0.0.1:1234")
+        self.assertEqual(validate_lmstudio_url("http://192.168.1.5:1234/v1"), "http://192.168.1.5:1234")
+        for bad in ("ftp://x", "127.0.0.1:1234", "http://user:pw@host:1", "http://host/other/path", ""):
+            with self.assertRaises(ApiError, msg=bad):
+                validate_lmstudio_url(bad)
+
+    def test_reasoning_blocks_are_removed_even_when_split_across_stream_chunks(self):
+        self.assertEqual(visible_reasoning_free("<think>x</think>Hello", final=True), "Hello")
+        self.assertEqual(visible_reasoning_free("Hi <think>still thinking", final=False), "Hi ")
+        self.assertEqual(visible_reasoning_free("Hi <thi", final=False), "Hi ")
+        self.assertEqual(visible_reasoning_free("a < b", final=True), "a < b")
+        raw, emitted = "", ""
+        for chunk in ["<th", "ink>plan</th", "ink>An", "swer <", "b>"]:
+            raw += chunk
+            visible = visible_reasoning_free(raw)
+            self.assertTrue(visible.startswith(emitted))
+            emitted = visible
+        self.assertEqual(visible_reasoning_free(raw, final=True), "Answer <b>")
+
+    @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open")
+    def test_lmstudio_chat_request_shape_usage_and_context_limit(self, mocked_open):
+        mocked_open.return_value = FakeResponse(
+            {"model": "meta/llama-3", "choices": [{"message": {"content": "<think>hm</think>Hi there"}}],
+             "usage": {"prompt_tokens": 30, "completion_tokens": 5}}
+        )
+        client = LMStudioClient("http://127.0.0.1:1234", {"temperature": 0.2, "max_output_tokens": 50, "stop_sequences": ["END"], "thinking_level": "high"})
+        spec = lmstudio_model_spec("meta/llama-3")
+        answer = client.generate(spec, [{"role": "user", "content": "Hi"}, {"role": "model", "content": "Hello"}, {"role": "user", "content": "More"}], "Be brief.")
+        request = mocked_open.call_args.args[0]
+        body = json.loads(request.data)
+        self.assertEqual(answer, "Hi there")
+        self.assertEqual(request.full_url, "http://127.0.0.1:1234/v1/chat/completions")
+        self.assertIsNone(request.get_header("X-goog-api-key"))
+        self.assertEqual(body["model"], "meta/llama-3")
+        self.assertEqual([m["role"] for m in body["messages"]], ["system", "user", "assistant", "user"])
+        self.assertEqual((body["temperature"], body["max_tokens"], body["stop"], body["stream"]), (0.2, 50, ["END"], False))
+        self.assertNotIn("thinking_level", body)
+        self.assertEqual((client.usage_input, client.usage_output, client.last_prompt_tokens), (30, 5, 30))
+        self.assertEqual(client.model_version, "lmstudio:meta/llama-3")
+        mocked_open.return_value = FakeResponse({"id": "meta/llama-3", "loaded_context_length": 4096, "max_context_length": 8192})
+        self.assertEqual(client.model_input_limit("lmstudio:meta/llama-3"), 4096)
+        self.assertTrue(mocked_open.call_args.args[0].full_url.endswith("/api/v0/models/meta/llama-3"))
+        mocked_open.return_value = FakeResponse({"data": [{"id": "a"}, {"id": "text-embedding-nomic"}, {"id": "b"}]})
+        self.assertEqual(client.list_models(), ["a", "b"])
+
+    @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open")
+    def test_lmstudio_stream_hides_reasoning_and_reads_final_usage(self, mocked_open):
+        events = [
+            {"model": "m", "choices": [{"delta": {"content": "<think>plan"}}]},
+            {"model": "m", "choices": [{"delta": {"content": "</think>Hel"}}]},
+            {"model": "m", "choices": [{"delta": {"content": "lo"}}]},
+            {"model": "m", "choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": 4}},
+        ]
+        lines = [("data: " + json.dumps(event) + "\n").encode() for event in events] + [b"data: [DONE]\n"]
+        response = io.BytesIO(b"".join(lines))
+        response.__enter__ = lambda self_: self_
+        response.__exit__ = lambda *a: None
+        mocked_open.return_value = response
+        client = LMStudioClient("http://127.0.0.1:1234")
+        chunks = []
+        answer = client.generate_stream(lmstudio_model_spec("m"), [{"role": "user", "content": "Hi"}], "", chunks.append)
+        self.assertEqual((answer, "".join(chunks)), ("Hello", "Hello"))
+        self.assertEqual((client.usage_input, client.usage_output), (12, 4))
+        self.assertTrue(json.loads(mocked_open.call_args.args[0].data)["stream_options"]["include_usage"])
+
+    def test_picker_lists_lmstudio_models_or_a_not_running_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+            with patch.object(LMStudioClient, "list_models", return_value=["mock-llama-3"]):
+                self.assertEqual([m.identifier for m in tui.fetch_lmstudio_models()], ["lmstudio:mock-llama-3"])
+            with patch.object(LMStudioClient, "list_models", side_effect=ApiError("Network error: refused")):
+                self.assertEqual(tui.fetch_lmstudio_models(), [LMSTUDIO_OFFLINE_ENTRY])
+            with patch.object(LMStudioClient, "list_models", return_value=[]):
+                self.assertEqual(tui.fetch_lmstudio_models(), [LMSTUDIO_OFFLINE_ENTRY])
+            self.assertIn("LM Studio", tui.friendly_error(ApiError("Network error: refused"), lmstudio_model_spec("m")))
+            self.assertTrue(tui.friendly_error(ApiError("HTTP 400: bad"), lmstudio_model_spec("m")).startswith("LM Studio:"))
+
+    def test_chatting_with_an_lmstudio_model_needs_no_key_and_is_free(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+            tui.data["model"] = "lmstudio:meta/llama-3"
+            tui.data["settings"]["streaming"] = False
+            calls = []
+
+            def fake_open(request, timeout=None):
+                calls.append(request.full_url)
+                if "/api/v0/models/" in request.full_url:
+                    return FakeResponse({"loaded_context_length": 4096})
+                return FakeResponse({"model": "meta/llama-3", "choices": [{"message": {"content": "local answer"}}],
+                                     "usage": {"prompt_tokens": 50, "completion_tokens": 7}})
+
+            with patch.object(app.GOOGLE_API_OPENER, "open", side_effect=fake_open), patch.object(tui, "draw_chat"):
+                tui.handle_input(FakeScreen([]), "hello")
+            self.assertEqual(tui.data["history"][-1], {"role": "model", "content": "local answer", "model_id": "lmstudio:meta/llama-3"})
+            self.assertEqual(tui.data["usage"]["context"], 50)
+            self.assertEqual(tui.data["usage"]["cost"], 0.0)
+            self.assertFalse(tui.data["usage"]["unpriced"])
+            self.assertEqual(tui.context_limits["lmstudio:meta/llama-3"], 4096)
+            self.assertIn("meta/llama-3 (LM Studio)", tui.header_parts()[0])
+            self.assertIn("context 50/4,096", tui.header_parts()[1])
+            self.assertTrue(all(url.startswith("http://127.0.0.1:1234/") for url in calls))
+
+    def test_model_picker_filter_accepts_every_letter_including_q_j_and_k(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+            with patch.object(Tui, "show_cursor"), patch.object(
+                LMStudioClient, "list_models", return_value=["qwen/jk-quick"]
+            ):
+                # Typing "qwen/jk" must filter to the LM Studio model; Enter then selects it.
+                tui.select_model(FakeScreen(list("qwen/jk") + ["\r"]))
+            self.assertEqual(tui.data["model"], "lmstudio:qwen/jk-quick")
+
+    @staticmethod
+    def http_error(code, body):
+        return urllib.error.HTTPError("http://127.0.0.1:1234/v1/chat/completions", code, "err", {}, io.BytesIO(body))
+
+    def lmstudio_replies(self, mocked_open, replies):
+        """Queue replies for the opener: dicts become JSON responses, exceptions are raised."""
+        queue = list(replies)
+
+        def fake_open(request, timeout=None):
+            item = queue.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return FakeResponse(item)
+
+        mocked_open.side_effect = fake_open
+        return queue
+
+    @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open")
+    def test_lmstudio_model_list_hides_embeddings_and_reports_loaded_state_and_context(self, mocked_open):
+        responses = {
+            "/v1/models": {"data": [{"id": "chat-a"}, {"id": "embed-b"}, {"id": "chat-c"}]},
+            "/api/v1/models": {"models": [
+                {"type": "llm", "key": "chat-a", "max_context_length": 32768, "loaded_instances": [{"id": "chat-a", "config": {"context_length": 4096}}]},
+                {"type": "embedding", "key": "embed-b", "max_context_length": 2048, "loaded_instances": []},
+                {"type": "llm", "key": "chat-c", "max_context_length": 8192, "loaded_instances": []},
+            ]},
+        }
+        mocked_open.side_effect = lambda request, timeout=None: FakeResponse(responses[request.full_url.split("1234")[-1]])
+        client = LMStudioClient("http://127.0.0.1:1234")
+        self.assertEqual(client.list_models(), ["chat-a", "chat-c"])
+        self.assertEqual(client.model_info["chat-a"], {"type": "llm", "loaded": True, "context": 4096})
+        self.assertEqual(client.model_info["chat-c"]["context"], 8192)
+        self.assertEqual(client.model_input_limit("lmstudio:chat-a"), 4096)
+
+    @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open")
+    def test_lmstudio_model_list_falls_back_to_v0_then_to_name_heuristics(self, mocked_open):
+        def fake_open(request, timeout=None):
+            path = request.full_url.split("1234")[-1]
+            if path == "/v1/models":
+                return FakeResponse({"data": [{"id": "chat-a"}, {"id": "text-embedding-nomic"}]})
+            if path == "/api/v0/models":
+                return FakeResponse({"data": [{"id": "chat-a", "type": "vlm", "state": "loaded", "max_context_length": 8192, "loaded_context_length": 2048}]})
+            raise self.http_error(404, b'{"error":"Unexpected endpoint"}')
+
+        mocked_open.side_effect = fake_open
+        client = LMStudioClient("http://127.0.0.1:1234")
+        self.assertEqual(client.list_models(), ["chat-a"])
+        self.assertEqual(client.model_info["chat-a"], {"type": "vlm", "loaded": True, "context": 2048})
+        mocked_open.side_effect = lambda request, timeout=None: (
+            FakeResponse({"data": [{"id": "chat-a"}, {"id": "text-embedding-nomic"}]})
+            if request.full_url.endswith("/v1/models") else (_ for _ in ()).throw(self.http_error(404, b"nope"))
+        )
+        self.assertEqual(LMStudioClient("http://127.0.0.1:1234").list_models(), ["chat-a"])
+
+    @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open")
+    def test_lmstudio_retries_with_the_system_prompt_merged_when_the_template_rejects_it(self, mocked_open):
+        good = {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 9, "completion_tokens": 1}}
+        self.lmstudio_replies(mocked_open, [self.http_error(400, b'{"error":"Only user and assistant roles are supported!"}'), good])
+        client = LMStudioClient("http://127.0.0.1:1234")
+        answer = client.generate(lmstudio_model_spec("m"), [{"role": "user", "content": "Hi"}], "Be brief.")
+        first, second = [json.loads(call.args[0].data) for call in mocked_open.call_args_list]
+        self.assertEqual(answer, "ok")
+        self.assertEqual([m["role"] for m in first["messages"]], ["system", "user"])
+        self.assertEqual(second["messages"], [{"role": "user", "content": "Be brief.\n\nHi"}])
+        self.assertTrue(client.merge_system)
+        self.assertEqual((client.usage_input, client.usage_output), (9, 1))  # the failed attempt is not counted
+        # An unrelated 400 is not retried.
+        self.lmstudio_replies(mocked_open, [self.http_error(400, b'{"error":"model crashed"}')])
+        with self.assertRaisesRegex(ApiError, "model crashed"):
+            LMStudioClient("http://127.0.0.1:1234").generate(lmstudio_model_spec("m"), [{"role": "user", "content": "Hi"}], "Be brief.")
+
+    @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open")
+    def test_lmstudio_retries_without_stream_options_and_estimates_missing_usage(self, mocked_open):
+        def stream(events):
+            lines = [("data: " + json.dumps(e) + "\n").encode() for e in events] + [b"data: [DONE]\n"]
+            response = io.BytesIO(b"".join(lines))
+            response.__enter__ = lambda self_: self_
+            response.__exit__ = lambda *a: None
+            return response
+
+        chunks = [{"choices": [{"delta": {"content": "Hello there friend"}, "finish_reason": None}]},
+                  {"choices": [{"delta": {}, "finish_reason": "length"}]}]
+        mocked_open.side_effect = [self.http_error(400, b'{"error":{"message":"Unrecognized key: stream_options"}}'), stream(chunks)]
+        client = LMStudioClient("http://127.0.0.1:1234")
+        out = []
+        answer = client.generate_stream(lmstudio_model_spec("m"), [{"role": "user", "content": "x" * 40}], "", out.append)
+        bodies = [json.loads(call.args[0].data) for call in mocked_open.call_args_list]
+        self.assertIn("stream_options", bodies[0])
+        self.assertNotIn("stream_options", bodies[1])
+        self.assertFalse(client.include_usage)
+        self.assertEqual((answer, client.finish_reason), ("Hello there friend", "length"))
+        self.assertEqual((client.usage_input, client.usage_output, client.last_prompt_tokens), (10, 4, 10))
+
+    @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open")
+    def test_lmstudio_stream_counts_cumulative_usage_once_and_reports_error_events(self, mocked_open):
+        def stream(events):
+            lines = [("data: " + json.dumps(e) + "\n").encode() for e in events]
+            response = io.BytesIO(b"".join(lines))
+            response.__enter__ = lambda self_: self_
+            response.__exit__ = lambda *a: None
+            return response
+
+        mocked_open.return_value = stream([
+            {"choices": [{"delta": {"content": "a"}}], "usage": {"prompt_tokens": 7, "completion_tokens": 1}},
+            {"choices": [{"delta": {"content": "b"}}], "usage": {"prompt_tokens": 7, "completion_tokens": 2}},
+        ])
+        client = LMStudioClient("http://127.0.0.1:1234")
+        client.generate_stream(lmstudio_model_spec("m"), [{"role": "user", "content": "Hi"}], "", lambda _t: None)
+        self.assertEqual((client.usage_input, client.usage_output), (7, 2))
+        mocked_open.return_value = stream([{"choices": [{"delta": {"content": "a"}}]}, {"error": {"message": "model unloaded"}}])
+        with self.assertRaisesRegex(ApiError, "model unloaded"):
+            LMStudioClient("http://127.0.0.1:1234").generate_stream(lmstudio_model_spec("m"), [{"role": "user", "content": "Hi"}], "", lambda _t: None)
+
+    def test_lmstudio_body_merges_back_to_back_roles_and_skips_empty_messages(self):
+        client = LMStudioClient("http://127.0.0.1:1234", {"top_k": 5, "seed": 3, "presence_penalty": 0.5})
+        body = client._chat_body(
+            lmstudio_model_spec("m"),
+            [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}, {"role": "model", "content": ""},
+             {"role": "model", "content": "c"}, {"role": "user", "content": "d"}],
+            "Sys", False, False, True,
+        )
+        self.assertEqual(
+            body["messages"],
+            [{"role": "system", "content": "Sys"}, {"role": "user", "content": "a\n\nb"},
+             {"role": "assistant", "content": "c"}, {"role": "user", "content": "d"}],
+        )
+        self.assertEqual((body["top_k"], body["seed"], body["presence_penalty"]), (5, 3, 0.5))
+        self.assertNotIn("stream_options", body)
+        self.assertNotIn("system", [m["role"] for m in client._chat_body(lmstudio_model_spec("m"), [{"role": "assistant", "content": "x"}], "Sys", False, True, True)["messages"]])
+
+    @patch("gemini_legacy_tui.GOOGLE_API_OPENER.open")
+    def test_lmstudio_reads_content_parts_and_reports_odd_responses(self, mocked_open):
+        mocked_open.return_value = FakeResponse({"choices": [{"message": {"content": [{"type": "text", "text": "Hel"}, {"type": "text", "text": "lo"}]}}]})
+        client = LMStudioClient("http://127.0.0.1:1234")
+        self.assertEqual(client.generate(lmstudio_model_spec("m"), [{"role": "user", "content": "Hi"}], ""), "Hello")
+        for payload, message in (({"choices": []}, "no text"), ({"choices": [{"message": {"content": "<think>only</think>"}}]}, "no text")):
+            mocked_open.return_value = FakeResponse(payload)
+            with self.assertRaisesRegex(ApiError, message):
+                LMStudioClient("http://127.0.0.1:1234").generate(lmstudio_model_spec("m"), [{"role": "user", "content": "Hi"}], "")
+
+    def test_reasoning_removal_handles_stray_closers_other_tags_and_harmony(self):
+        self.assertEqual(visible_reasoning_free("I will plan this.\n</think>\nThe answer.", final=True).strip(), "The answer.")
+        self.assertEqual(visible_reasoning_free("<reasoning>x</reasoning>A <thinking>y</thinking>B", final=True), "A B")
+        harmony = "<|channel|>analysis<|message|>hmm<|end|><|start|>assistant<|channel|>final<|message|>Result<|return|>"
+        self.assertEqual(visible_reasoning_free(harmony, final=True), "Result")
+        self.assertEqual(visible_reasoning_free("<|channel|>analysis<|message|>still going", final=False), "")
+        self.assertEqual(visible_reasoning_free("Result <|chan", final=False), "Result ")
+        self.assertEqual(visible_reasoning_free("1 < 2 and 3 > 2", final=True), "1 < 2 and 3 > 2")
+
+    def test_lmstudio_error_messages_cover_string_and_object_bodies_and_hide_tokens(self):
+        with patch.dict(os.environ, {"LMSTUDIO_API_KEY": "tok-123"}):
+            client = LMStudioClient("http://127.0.0.1:1234")
+        for body, expected in ((b'{"error":"plain text error"}', "plain text error"),
+                               (b'{"error":{"message":"object error"}}', "object error"),
+                               (b"not json at all", "not json at all"),
+                               (b'{"error":"bad token tok-123"}', "bad token [redacted]")):
+            self.assertEqual(client._http_error_message(self.http_error(400, body)), expected)
+        self.assertEqual(client._auth_headers()["Authorization"], "Bearer tok-123")
+        self.assertNotIn("Authorization", LMStudioClient("http://127.0.0.1:1234")._auth_headers())
+
+    def test_lmstudio_friendly_errors_give_actionable_advice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+            spec = lmstudio_model_spec("qwen/qwen3-8b")
+            self.assertIn("API token", tui.friendly_error(ApiError("HTTP 401: Unauthorized"), spec))
+            self.assertIn("/clear", tui.friendly_error(ApiError("HTTP 400: context length exceeded"), spec))
+            self.assertIn("could not find or load", tui.friendly_error(ApiError("HTTP 404: model not found"), spec))
+            self.assertIn("qwen/qwen3-8b (LM Studio)", tui.friendly_error(ApiError("HTTP 404: model not found"), spec))
+            self.assertEqual(tui.friendly_error(ApiError("HTTP 500: boom"), spec), "LM Studio: HTTP 500: boom")
+
+    def test_lmstudio_ids_with_unusual_characters_are_kept(self):
+        odd = "lmstudio:TheBloke/Llama 2 (7B) chat@Q4_K_M:2"
+        self.assertEqual(validate_model_id(odd), odd)
+        self.assertEqual(SessionStore.normalize({"model": odd})["model"], odd)
+        self.assertEqual(validate_model_id("lmstudio:caf\u00e9-7b"), "lmstudio:caf\u00e9-7b")
+        for bad in ("lmstudio:", "lmstudio:bad\x00id", "lmstudio:new\nline"):
+            with self.assertRaises(ApiError, msg=repr(bad)):
+                validate_model_id(bad)
+
+    def test_lmstudio_quirks_and_length_stop_are_remembered_per_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tui = Tui("", SessionStore(Path(directory)))
+            tui.data["model"] = "lmstudio:strict"
+            tui.data["settings"]["streaming"] = False
+            seen = []
+
+            def fake_open(request, timeout=None):
+                if request.full_url.endswith("/v1/chat/completions"):
+                    body = json.loads(request.data)
+                    seen.append([m["role"] for m in body["messages"]])
+                    if any(m["role"] == "system" for m in body["messages"]):
+                        raise self.http_error(400, b'{"error":"Conversation roles must alternate user/assistant"}')
+                    return FakeResponse({"choices": [{"message": {"content": "cut"}, "finish_reason": "length"}]})
+                raise self.http_error(404, b"{}")
+
+            with patch.object(app.GOOGLE_API_OPENER, "open", side_effect=fake_open), patch.object(tui, "draw_chat"):
+                tui.handle_input(FakeScreen([]), "one")
+                self.assertEqual(seen, [["system", "user"], ["user"]])
+                self.assertEqual(tui.lmstudio_quirks["lmstudio:strict"], {"merge_system": True, "include_usage": True})
+                self.assertIn("token limit", tui.status)
+                tui.handle_input(FakeScreen([]), "two")
+                self.assertEqual(seen[-1], ["user", "assistant", "user"])  # no wasted first attempt this time
 
 
 if __name__ == "__main__":

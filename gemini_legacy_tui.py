@@ -53,6 +53,7 @@ STREAM_RENDER_DELAY_MS = 12
 MAX_STREAM_EVENT_BYTES = 1024 * 1024
 MAX_STREAM_TEXT_CHARS = 2 * 1024 * 1024
 API_BASE_URL = "https://generativelanguage.googleapis.com"
+LMSTUDIO_URL = "http://127.0.0.1:1234"
 DEFAULT_CONTEXT_WINDOW = 1_048_576  # input tokens; replaced by the API's inputTokenLimit once known
 MOCK_PORT = 8765
 MOCK_BASE_URL = "http://127.0.0.1:{}".format(MOCK_PORT)
@@ -260,6 +261,11 @@ def validate_model_id(value: str) -> str:
     identifier = value.strip()
     if not identifier or len(identifier) > MAX_MODEL_ID_CHARS:
         raise ApiError("The model ID must be between 1 and {} characters.".format(MAX_MODEL_ID_CHARS))
+    if identifier.startswith("lmstudio:"):
+        # LM Studio IDs can hold slashes, colons, @, spaces, and similar; they only travel in JSON and quoted paths.
+        if identifier == "lmstudio:" or not identifier.isprintable():
+            raise ApiError("LM Studio model IDs must be non-empty and contain only printable characters.")
+        return identifier
     if not all(
         character.isascii() and (character.isalnum() or character in ("-", "_", "."))
         for character in identifier
@@ -779,6 +785,8 @@ MODEL_PRICES: Dict[str, Sequence[Tuple[Optional[date], float, float]]] = {
 
 def estimate_cost(model_id: str, input_tokens: int, output_tokens: int, today: Optional[date] = None) -> Optional[float]:
     """Estimated USD for one request, or None when the model's price is not known."""
+    if model_id.startswith("lmstudio:"):
+        return 0.0  # local models cost nothing to run
     prices = MODEL_PRICES.get(model_id)
     if prices is None:
         known = [name for name in MODEL_PRICES if model_id.startswith(name + "-")]
@@ -934,6 +942,7 @@ class GoogleApiClient:
         self.api_key = validate_api_key(api_key)
         self.generation = generation or {}
         self.base_url = base_url
+        self.timeout = 90
         self.usage_input = 0  # prompt tokens billed by the requests this client made
         self.usage_output = 0  # response tokens, including thinking tokens
         self.last_prompt_tokens = 0  # prompt size of the most recent request, i.e. the current context
@@ -941,6 +950,11 @@ class GoogleApiClient:
 
     def _base(self) -> str:
         return self.base_url or API_BASE_URL
+
+    def _auth_headers(self) -> dict:
+        if not self.api_key:
+            raise ApiError("No API key. Quit and relaunch with GEMINI_API_KEY set (or --api-key-file).")
+        return {"User-Agent": USER_AGENT, "x-goog-api-key": self.api_key}
 
     @staticmethod
     def _token_counts(response: dict) -> Tuple[int, int]:
@@ -965,10 +979,7 @@ class GoogleApiClient:
             self.model_version = version.strip()[:MAX_MODEL_ID_CHARS]
 
     def _request(self, url: str, body: Optional[dict] = None) -> dict:
-        if not self.api_key:
-            raise ApiError("No API key. Quit and relaunch with GEMINI_API_KEY set (or --api-key-file).")
-
-        headers = {"User-Agent": USER_AGENT, "x-goog-api-key": self.api_key}
+        headers = self._auth_headers()
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
@@ -978,7 +989,7 @@ class GoogleApiClient:
 
         request = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
         try:
-            with GOOGLE_API_OPENER.open(request, timeout=90) as response:
+            with GOOGLE_API_OPENER.open(request, timeout=self.timeout) as response:
                 raw = self._read_limited(response, MAX_API_RESPONSE_BYTES, "Google response")
                 parsed = json.loads(raw.decode("utf-8", errors="replace"))
                 if not isinstance(parsed, dict):
@@ -1295,6 +1306,426 @@ class GoogleApiClient:
         return text
 
 
+LMSTUDIO_PREFIX = "lmstudio:"
+LMSTUDIO_GROUP = "LM Studio (local)"
+LMSTUDIO_OFFLINE_ENTRY = ModelSpec(
+    "__lmstudio_offline__",
+    "LM Studio is not running",
+    LMSTUDIO_GROUP,
+    "lmstudio",
+    "Start LM Studio's local server (Developer tab, Start Server) or pass --lmstudio-url",
+)
+REASONING_TAGS = ("think", "thinking", "reasoning", "thought")
+REASONING_BLOCK = re.compile(r"<({})>.*?</\1>".format("|".join(REASONING_TAGS)), re.DOTALL)
+REASONING_OPENERS = tuple("<{}>".format(tag) for tag in REASONING_TAGS) + ("<|channel|>",)
+REASONING_CLOSERS = tuple("</{}>".format(tag) for tag in REASONING_TAGS)
+HARMONY_FINAL = "<|channel|>final<|message|>"
+HARMONY_TOKEN = re.compile(r"<\|(?:end|return|start|call)\|>.*", re.DOTALL)
+# Errors that suggest the model's chat template rejected the system role or the message order.
+ROLE_ERROR = re.compile(r"\brole|system|alternat|template|jinja", re.IGNORECASE)
+
+
+def lmstudio_model_spec(model_id: str, note: str = "") -> ModelSpec:
+    """A picker entry for one model LM Studio reported (model_id is LM Studio's own ID)."""
+    return ModelSpec(
+        LMSTUDIO_PREFIX + model_id,
+        model_id,
+        LMSTUDIO_GROUP,
+        "lmstudio",
+        note or "Local model served by LM Studio; free to run",
+    )
+
+
+def display_model_name(identifier: str) -> str:
+    """How a model ID is shown in the header, chat, and stats."""
+    if identifier.startswith(LMSTUDIO_PREFIX):
+        return identifier[len(LMSTUDIO_PREFIX) :] + " (LM Studio)"
+    return identifier
+
+
+def visible_reasoning_free(raw: str, final: bool = False) -> str:
+    """Remove reasoning from local-model output so only the answer remains.
+
+    Handles <think>/<thinking>/<reasoning>/<thought> blocks, a closing tag with no opener (some chat
+    templates put the opener in the prompt), and gpt-oss "harmony" channels. While streaming
+    (final=False) an unfinished block and a trailing partial tag are held back."""
+    text = REASONING_BLOCK.sub("", raw)
+    if "<|channel|>" in text:
+        if HARMONY_FINAL in text:
+            text = HARMONY_TOKEN.sub("", text.split(HARMONY_FINAL)[-1])
+        else:
+            text = text[: text.find("<|channel|>")]
+    first_open = min((text.find(opener) for opener in REASONING_OPENERS if opener in text), default=-1)
+    if first_open != -1:
+        text = text[:first_open]
+    last_close = max((text.rfind(closer) + len(closer) for closer in REASONING_CLOSERS if closer in text), default=-1)
+    if last_close != -1:
+        text = text[last_close:]
+    if not final:
+        for size in range(max(map(len, REASONING_OPENERS)) - 1, 0, -1):
+            if len(text) >= size and any(opener.startswith(text[-size:]) for opener in REASONING_OPENERS):
+                text = text[:-size]
+                break
+    return text
+
+
+def validate_lmstudio_url(value: str) -> str:
+    parsed = urllib.parse.urlparse(value.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise ApiError("The LM Studio URL must look like http://127.0.0.1:1234")
+    if parsed.path.rstrip("/") not in ("", "/v1"):
+        raise ApiError("The LM Studio URL should be just the server address, like http://127.0.0.1:1234")
+    return "{}://{}".format(parsed.scheme, parsed.netloc)
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token count (about 4 characters each) for servers that do not report usage."""
+    return max(1, len(text) // 4) if text else 0
+
+
+class LMStudioClient(GoogleApiClient):
+    """LM Studio's local OpenAI-compatible server (chat completions, models, streaming).
+
+    The documented /v1/chat/completions parameters are used. Two quirks are handled by retrying: models whose
+    chat template rejects a system message (it is merged into the first user message), and servers that
+    reject stream_options (usage is then estimated). Both are remembered in merge_system / include_usage."""
+
+    def __init__(
+        self,
+        base_url: str,
+        generation: Optional[dict] = None,
+        timeout: int = 600,
+        merge_system: bool = False,
+        include_usage: bool = True,
+    ) -> None:
+        super().__init__("", generation, base_url)
+        self.timeout = timeout
+        self.merge_system = merge_system
+        self.include_usage = include_usage
+        self.lmstudio_key = os.environ.get("LMSTUDIO_API_KEY", "").strip()
+        self.finish_reason = ""
+        self.model_info: Dict[str, dict] = {}  # model id -> {"loaded": bool, "context": Optional[int]} when known
+        self._reported_usage = False
+        self._native_checked = False
+
+    def _auth_headers(self) -> dict:
+        headers = {"User-Agent": USER_AGENT}
+        if self.lmstudio_key:
+            headers["Authorization"] = "Bearer " + self.lmstudio_key
+        return headers
+
+    def _http_error_message(self, error: urllib.error.HTTPError) -> str:
+        try:
+            raw_bytes = error.read(MAX_API_ERROR_BYTES + 1)
+        except (AttributeError, OSError):
+            raw_bytes = b""
+        truncated = len(raw_bytes) > MAX_API_ERROR_BYTES
+        raw = raw_bytes[:MAX_API_ERROR_BYTES].decode("utf-8", errors="replace").strip()
+        message = raw
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            # LM Studio's error body is not documented: accept {"error": "text"} and {"error": {"message": ...}}.
+            details = parsed.get("error", parsed.get("message"))
+            if isinstance(details, str) and details.strip():
+                message = details.strip()
+            elif isinstance(details, dict) and isinstance(details.get("message"), str):
+                message = details["message"]
+        if not message:
+            message = str(error.reason or "request failed")
+        if self.lmstudio_key:
+            message = message.replace(self.lmstudio_key, "[redacted]")
+        return message + (" [truncated]" if truncated else "")
+
+    @staticmethod
+    def _bare_id(identifier: str) -> str:
+        return identifier[len(LMSTUDIO_PREFIX) :] if identifier.startswith(LMSTUDIO_PREFIX) else identifier
+
+    # ---- model discovery -------------------------------------------------------------------------------------
+
+    def _native_models(self) -> Dict[str, dict]:
+        """Details from LM Studio's native API (v1, then v0): type, loaded state, and context lengths."""
+        if self._native_checked:
+            return self.model_info
+        self._native_checked = True
+        info: Dict[str, dict] = {}
+        try:
+            response = self._request(self._base() + "/api/v1/models")
+            for item in response.get("models", []):
+                if not isinstance(item, dict) or not isinstance(item.get("key"), str):
+                    continue
+                instances = [i for i in item.get("loaded_instances", []) if isinstance(i, dict)]
+                loaded_context = next(
+                    (i["config"]["context_length"] for i in instances
+                     if isinstance(i.get("config"), dict) and isinstance(i["config"].get("context_length"), int)),
+                    None,
+                )
+                entry = {
+                    "type": str(item.get("type", "")),
+                    "loaded": bool(instances),
+                    "context": loaded_context or item.get("max_context_length"),
+                }
+                info[item["key"]] = entry
+                for instance in instances:
+                    if isinstance(instance.get("id"), str):
+                        info[instance["id"]] = entry
+        except (ApiError, TypeError, KeyError):
+            info = {}
+        if not info:
+            try:
+                response = self._request(self._base() + "/api/v0/models")
+                for item in response.get("data", []):
+                    if isinstance(item, dict) and isinstance(item.get("id"), str):
+                        info[item["id"]] = {
+                            "type": str(item.get("type", "")),
+                            "loaded": item.get("state") == "loaded",
+                            "context": item.get("loaded_context_length") or item.get("max_context_length"),
+                        }
+            except (ApiError, TypeError):
+                info = {}
+        for entry in info.values():
+            if not isinstance(entry["context"], int) or isinstance(entry["context"], bool) or entry["context"] <= 0:
+                entry["context"] = None
+        self.model_info = info
+        return info
+
+    def list_models(self) -> List[str]:
+        response = self._request(self._base() + "/v1/models")
+        data = response.get("data", [])
+        if not isinstance(data, list):
+            raise ApiError("LM Studio returned an unexpected model list.")
+        ids = [item["id"] for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)]
+        native = self._native_models()
+        usable = []
+        for name in ids:
+            kind = native.get(name, {}).get("type", "")
+            if kind.startswith("embed") or (not kind and "embed" in name.lower()):
+                continue  # embedding models cannot chat
+            if 0 < len(name) <= MAX_MODEL_ID_CHARS - len(LMSTUDIO_PREFIX):
+                usable.append(name)
+        return usable
+
+    def model_input_limit(self, model_id: str) -> Optional[int]:
+        bare = self._bare_id(model_id)
+        entry = self._native_models().get(bare)
+        if entry and entry["context"]:
+            return entry["context"]
+        try:
+            response = self._request(self._base() + "/api/v0/models/" + urllib.parse.quote(bare, safe="/"))
+        except ApiError:
+            return None
+        for field in ("loaded_context_length", "max_context_length"):
+            value = response.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        return None
+
+    # ---- chat ------------------------------------------------------------------------------------------------
+
+    def _chat_body(
+        self, model: ModelSpec, history: Sequence[Dict[str, str]], system_instruction: str, stream: bool,
+        merge_system: bool, include_usage: bool,
+    ) -> dict:
+        system_text = system_instruction.strip()
+        messages: List[Dict[str, str]] = []
+        for item in history:
+            if item["role"] not in ("user", "model") or not item["content"]:
+                continue
+            role = "user" if item["role"] == "user" else "assistant"
+            if messages and messages[-1]["role"] == role:
+                # Several chat templates insist that roles alternate, so merge back-to-back messages.
+                messages[-1]["content"] += "\n\n" + item["content"]
+            else:
+                messages.append({"role": role, "content": item["content"]})
+        if system_text:
+            if merge_system:
+                if messages and messages[0]["role"] == "user":
+                    messages[0]["content"] = system_text + "\n\n" + messages[0]["content"]
+                else:
+                    messages.insert(0, {"role": "user", "content": system_text})
+            else:
+                messages.insert(0, {"role": "system", "content": system_text})
+        body: dict = {"model": self._bare_id(model.identifier), "messages": messages, "stream": stream}
+        names = {
+            "temperature": "temperature",
+            "top_p": "top_p",
+            "top_k": "top_k",
+            "max_output_tokens": "max_tokens",
+            "seed": "seed",
+            "presence_penalty": "presence_penalty",
+            "frequency_penalty": "frequency_penalty",
+        }
+        for key, api_name in names.items():
+            if key in self.generation:
+                body[api_name] = self.generation[key]
+        if self.generation.get("stop_sequences"):
+            body["stop"] = list(self.generation["stop_sequences"])
+        if stream and include_usage:
+            body["stream_options"] = {"include_usage": True}
+        return body
+
+    def _with_fallbacks(self, system_instruction: str, run: Callable[[bool, bool], object]) -> object:
+        merge, usage_option = self.merge_system, self.include_usage
+        for _ in range(3):
+            try:
+                result = run(merge, usage_option)
+            except ApiError as error:
+                text = str(error)
+                if not text.startswith(("HTTP 400", "HTTP 422", "HTTP 500")):
+                    raise
+                if usage_option and "stream_options" in text.lower():
+                    usage_option = False
+                    continue
+                if not merge and system_instruction.strip() and ROLE_ERROR.search(text):
+                    merge = True
+                    continue
+                raise
+            self.merge_system, self.include_usage = merge, usage_option
+            return result
+        raise ApiError("LM Studio rejected the request.")
+
+    def _record_usage(self, usage: object) -> None:
+        if not isinstance(usage, dict):
+            return
+        prompt_tokens, completion_tokens = usage.get("prompt_tokens"), usage.get("completion_tokens")
+        if isinstance(prompt_tokens, int) and not isinstance(prompt_tokens, bool) and prompt_tokens > 0:
+            self.usage_input += prompt_tokens
+            self.last_prompt_tokens = prompt_tokens
+            self._reported_usage = True
+        if isinstance(completion_tokens, int) and not isinstance(completion_tokens, bool) and completion_tokens > 0:
+            self.usage_output += completion_tokens
+            self._reported_usage = True
+
+    def _estimate_usage(self, body: dict, answer: str) -> None:
+        """Some servers send no token counts, so fall back to about 4 characters per token."""
+        if self._reported_usage:
+            return
+        prompt_tokens = estimate_tokens("".join(message["content"] for message in body["messages"]))
+        self.usage_input += prompt_tokens
+        self.usage_output += estimate_tokens(answer)
+        self.last_prompt_tokens = prompt_tokens
+
+    def generate(self, model: ModelSpec, history: Sequence[Dict[str, str]], system_instruction: str) -> str:
+        self.model_version = model.identifier
+
+        def run(merge: bool, usage_option: bool) -> str:
+            body = self._chat_body(model, history, system_instruction, False, merge, usage_option)
+            response = self._request(self._base() + "/v1/chat/completions", body)
+            self._reported_usage = False
+            self._record_usage(response.get("usage"))
+            choices = response.get("choices")
+            choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+            message = choice.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):  # content parts
+                content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+            if not isinstance(content, str):
+                raise ApiError("LM Studio returned no text.")
+            text = visible_reasoning_free(content, final=True).strip()
+            if not text:
+                raise ApiError("The model returned no text (it may have spent its whole token budget thinking).")
+            if len(text) > MAX_STREAM_TEXT_CHARS:
+                raise ApiError("The response exceeded the safety limit.")
+            self.finish_reason = str(choice.get("finish_reason") or "")
+            self._estimate_usage(body, text)
+            return text
+
+        return self._with_fallbacks(system_instruction, run)  # type: ignore[return-value]
+
+    def generate_stream(
+        self,
+        model: ModelSpec,
+        history: Sequence[Dict[str, str]],
+        system_instruction: str,
+        on_text: Callable[[str], None],
+    ) -> str:
+        self.model_version = model.identifier
+
+        def run(merge: bool, usage_option: bool) -> str:
+            body = self._chat_body(model, history, system_instruction, True, merge, usage_option)
+            data = json.dumps(body).encode("utf-8")
+            if len(data) > MAX_API_REQUEST_BYTES:
+                raise ApiError("Conversation context exceeded the request safety limit. Use /clear and try again.")
+            headers = self._auth_headers()
+            headers.update({"Content-Type": "application/json", "Accept": "text/event-stream"})
+            request = urllib.request.Request(
+                self._base() + "/v1/chat/completions", data=data, headers=headers, method="POST"
+            )
+            raw_text = ""
+            emitted = ""
+            latest_usage: object = None
+            finish = ""
+            try:
+                with GOOGLE_API_OPENER.open(request, timeout=self.timeout) as response:
+                    while True:
+                        raw_line = response.readline(MAX_STREAM_EVENT_BYTES + 1)
+                        if not raw_line:
+                            break
+                        if len(raw_line) > MAX_STREAM_EVENT_BYTES:
+                            raise ApiError("A streaming event exceeded the safety limit.")
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(payload)
+                        except json.JSONDecodeError as error:
+                            raise ApiError("LM Studio returned an invalid streaming event.") from error
+                        if not isinstance(event, dict):
+                            raise ApiError("LM Studio returned an unexpected streaming event.")
+                        if "error" in event:
+                            details = event["error"]
+                            message = details.get("message") if isinstance(details, dict) else details
+                            raise ApiError("LM Studio stopped the reply: {}".format(message))
+                        if event.get("usage"):
+                            latest_usage = event["usage"]  # running totals, so keep only the latest
+                        choices = event.get("choices")
+                        choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+                        if choice.get("finish_reason"):
+                            finish = str(choice["finish_reason"])
+                        delta = choice.get("delta")
+                        chunk = delta.get("content") if isinstance(delta, dict) else None
+                        if isinstance(chunk, str) and chunk:
+                            raw_text += chunk
+                            if len(raw_text) > MAX_STREAM_TEXT_CHARS:
+                                raise ApiError("The streamed response exceeded the safety limit.")
+                            visible = visible_reasoning_free(raw_text)
+                            if visible.startswith(emitted):
+                                if len(visible) > len(emitted):
+                                    on_text(visible[len(emitted) :])
+                                    emitted = visible
+                            else:
+                                emitted = visible  # a stray closing tag removed text already shown; the final reply replaces it
+            except urllib.error.HTTPError as error:
+                raise ApiError("HTTP {}: {}".format(error.code, self._http_error_message(error))) from error
+            except urllib.error.URLError as error:
+                raise ApiError("Network error: {}".format(error.reason)) from error
+            except TimeoutError as error:
+                raise ApiError("Request timed out. Check LM Studio and try again.") from error
+            except OSError as error:
+                raise ApiError("Network error: {}".format(error)) from error
+            final = visible_reasoning_free(raw_text, final=True)
+            if final.startswith(emitted) and len(final) > len(emitted):
+                on_text(final[len(emitted) :])
+            text = final.strip()
+            if not text:
+                raise ApiError("The model returned no text (it may have spent its whole token budget thinking).")
+            self._reported_usage = False
+            self._record_usage(latest_usage)
+            self.finish_reason = finish
+            self._estimate_usage(body, text)
+            return text
+
+        return self._with_fallbacks(system_instruction, run)  # type: ignore[return-value]
+
+    def generate_with_tools(self, *_args, **_kwargs):
+        raise ApiError("Terminal access is not available for LM Studio models.")
+
+
 class SessionStore:
     def __init__(self, state_dir: Path) -> None:
         self.path = state_dir / STATE_FILE_NAME
@@ -1453,7 +1884,7 @@ class Tui:
         for item in self.data["history"]:
             if item["role"] == "model":
                 item["content"] = self.plain_terminal_response(item["content"])
-        self.status = "Ready" if self.api_key else "No API key. Quit and relaunch with GEMINI_API_KEY set or --api-key-file. The mock model works without one."
+        self.status = "Ready" if self.api_key else "No API key. Quit and relaunch with GEMINI_API_KEY set or --api-key-file. The mock and LM Studio models work without one."
         self.input_rows = 1
         self.available_models: Optional[set] = None
         self.running = True
@@ -1465,16 +1896,19 @@ class Tui:
         ]
         self.last_failed_prompt: Optional[str] = None
         self.context_limits: Dict[str, int] = {}
+        self.lmstudio_url = LMSTUDIO_URL
+        self.lmstudio_quirks: Dict[str, dict] = {}  # per model: workarounds that LM Studio needed
         self.command_permissions = "ask"  # ask, safe, or all; resets on restart
         self.stop_requested = False
 
     @property
     def model(self) -> ModelSpec:
         identifier = self.data["model"]
-        return MODEL_BY_ID.get(
-            identifier,
-            ModelSpec(identifier, identifier, "Custom Gemini Model", "gemini", "Custom model ID"),
-        )
+        if identifier in MODEL_BY_ID:
+            return MODEL_BY_ID[identifier]
+        if identifier.startswith(LMSTUDIO_PREFIX):
+            return lmstudio_model_spec(identifier[len(LMSTUDIO_PREFIX) :])
+        return ModelSpec(identifier, identifier, "Custom Gemini Model", "gemini", "Custom model ID")
 
     @property
     def streaming_enabled(self) -> bool:
@@ -1531,7 +1965,7 @@ class Tui:
         indent = "   " if compact else "       "
         for item in self.data["history"]:
             is_user = item["role"] == "user"
-            label = "YOU" if is_user else item.get("model_id", "UNKNOWN MODEL").upper()
+            label = "YOU" if is_user else display_model_name(item.get("model_id", "UNKNOWN MODEL")).upper()
             role_style = self.style("user" if is_user else "assistant", curses.A_BOLD)
             terminal_text, reply_text = ("", item["content"]) if is_user else self.split_terminal_lines(item["content"])
             # Terminal results are dimmed so they read differently from the model's own words.
@@ -1543,7 +1977,7 @@ class Tui:
             if reply_text or not terminal_text:
                 body.extend((line, self.style("text")) for line in self.wrap_content(reply_text, content_width))
             if compact:
-                compact_label = "You" if is_user else item.get("model_id", "Unknown model")
+                compact_label = "You" if is_user else display_model_name(item.get("model_id", "Unknown model"))
                 lines.append((compact_label + ": " + body[0][0], role_style if is_user else body[0][1]))
                 lines.extend((indent + line, style) for line, style in body[1:])
             elif is_user:
@@ -1561,7 +1995,7 @@ class Tui:
             if item["role"] == "user":
                 label = "YOU"
             else:
-                label = item.get("model_id", "UNKNOWN MODEL").upper()
+                label = display_model_name(item.get("model_id", "UNKNOWN MODEL")).upper()
             lines.append(label)
             lines.extend(item["content"].splitlines() or [""])
             lines.append("")
@@ -1600,9 +2034,13 @@ class Tui:
         return DEFAULT_CONTEXT_WINDOW if identifier.startswith("gemini-") else None
 
     def learn_context_window(self, client: "GoogleApiClient", model: ModelSpec) -> None:
-        if model.protocol != "gemini" or model.identifier in self.context_limits:
+        if model.protocol not in ("gemini", "lmstudio"):
+            return
+        # An LM Studio model can be reloaded with a different context length, so ask again each time.
+        if model.protocol == "gemini" and model.identifier in self.context_limits:
             return
         try:
+            client.timeout = 5
             limit = client.model_input_limit(model.identifier)
         except ApiError:
             return
@@ -1632,7 +2070,7 @@ class Tui:
             context,
             self.format_cost(usage),
         )
-        return self.model.identifier, rest
+        return display_model_name(self.model.identifier), rest
 
     def draw_header(self, screen: "curses._CursesWindow", width: int, compact: bool = False) -> None:
         model_id, rest = self.header_parts()
@@ -1884,16 +2322,24 @@ class Tui:
         use_tools = self.terminal_tools_active
         self.stop_requested = False
         generation = self.data["settings"].get("generation", {})
-        if selected_model.local_mock:
+        if selected_model.protocol == "lmstudio":
+            quirks = self.lmstudio_quirks.get(selected_model.identifier, {})
+            client = LMStudioClient(
+                self.lmstudio_url,
+                generation,
+                merge_system=quirks.get("merge_system", False),
+                include_usage=quirks.get("include_usage", True),
+            )
+        elif selected_model.local_mock:
             client = GoogleApiClient(MOCK_API_KEY, generation, MOCK_BASE_URL)
         else:
             client = GoogleApiClient(self.api_key, generation)
         if use_tools:
-            self.status = "Waiting for {}...   {}".format(selected_model.identifier, STOP_HINT)
+            self.status = "Waiting for {}...   {}".format(display_model_name(selected_model.identifier), STOP_HINT)
         elif self.streaming_enabled:
-            self.status = "Streaming {}...".format(selected_model.identifier)
+            self.status = "Streaming {}...".format(display_model_name(selected_model.identifier))
         else:
-            self.status = "Waiting for {}...".format(selected_model.identifier)
+            self.status = "Waiting for {}...".format(display_model_name(selected_model.identifier))
         try:
             if selected_model.local_mock:
                 start_mock_server()
@@ -1912,7 +2358,7 @@ class Tui:
                 self.data["history"].append(
                     {"role": "model", "content": content, "model_id": client.model_version or selected_model.identifier}
                 )
-            elif selected_model.protocol == "gemini" and self.streaming_enabled:
+            elif selected_model.protocol in ("gemini", "lmstudio") and self.streaming_enabled:
                 reply = {"role": "model", "content": "", "model_id": selected_model.identifier}
                 self.data["history"].append(reply)
                 self.draw_chat(screen)
@@ -1921,7 +2367,7 @@ class Tui:
                     fragments = self.display_fragments(self.plain_terminal_response(chunk))
                     for fragment in fragments:
                         reply["content"] += fragment
-                        self.status = "Streaming {}... {} chars".format(selected_model.identifier, len(reply["content"]))
+                        self.status = "Streaming {}... {} chars".format(display_model_name(selected_model.identifier), len(reply["content"]))
                         self.draw_chat(screen)
                         if len(fragments) > 1:
                             try:
@@ -1947,6 +2393,13 @@ class Tui:
                     }
                 )
             self.status = "Response complete."
+            if isinstance(client, LMStudioClient):
+                self.lmstudio_quirks[selected_model.identifier] = {
+                    "merge_system": client.merge_system,
+                    "include_usage": client.include_usage,
+                }
+                if client.finish_reason == "length":
+                    self.status = "Response stopped at the model's token limit. Raise Max output tokens in /thinking or LM Studio's context."
             self.last_failed_prompt = None
             self.learn_context_window(client, selected_model)
         except ApiError as error:
@@ -2104,6 +2557,17 @@ class Tui:
 
     def friendly_error(self, error: ApiError, model: ModelSpec) -> str:
         raw = str(error)
+        if model.protocol == "lmstudio":
+            lowered = raw.lower()
+            if raw.startswith("Network error"):
+                return "Could not reach LM Studio at {}. Start its local server (Developer tab, Start Server).".format(self.lmstudio_url)
+            if raw.startswith(("HTTP 401", "HTTP 403")):
+                return "LM Studio needs an API token. Create one in its Server Settings (Manage Tokens), set LMSTUDIO_API_KEY, and relaunch."
+            if "context" in lowered and any(word in lowered for word in ("length", "exceed", "overflow", "too long", "n_keep")):
+                return "The conversation no longer fits this model's context in LM Studio ({}). Use /clear or reload the model with a larger context.".format(raw[:120])
+            if raw.startswith("HTTP 404") or ("model" in lowered and ("not found" in lowered or "no such" in lowered)):
+                return "LM Studio could not find or load {}. Check that it is downloaded (and Just-In-Time loading is on): {}".format(display_model_name(model.identifier), raw[:120])
+            return "LM Studio: " + raw
         if model.local_mock and raw.startswith("Network error"):
             return "Could not reach the mock server on 127.0.0.1:{}. Run python3 tools/mock_gemini_server.py in another terminal.".format(MOCK_PORT)
         if raw.startswith("HTTP 429:") and "quota" in raw.lower():
@@ -2249,7 +2713,7 @@ class Tui:
                 elif label == "Terminal access":
                     value = "[ON]" if self.terminal_tools_setting else "[OFF]"
                     if not model_supports_terminal_tools(self.model.identifier):
-                        value += " (not supported by {})".format(self.model.identifier)
+                        value += " (not supported by {})".format(display_model_name(self.model.identifier))
                 elif label == "Theme":
                     value = self.theme.label
                 elif label == "System instruction":
@@ -2423,10 +2887,38 @@ class Tui:
             elif isinstance(key, str) and key.isprintable() and len(query) < 128:
                 query += key
 
+    def fetch_lmstudio_models(self) -> List[ModelSpec]:
+        """Models LM Studio reports right now, or a single placeholder row when its server is not running."""
+        client = LMStudioClient(self.lmstudio_url, timeout=2)
+        try:
+            names = client.list_models()
+        except ApiError:
+            return [LMSTUDIO_OFFLINE_ENTRY]
+        entries = []
+        for name in names:
+            info = client.model_info.get(name)
+            if info is None:
+                note = ""
+            elif info["loaded"]:
+                note = "Loaded in LM Studio; free to run"
+            else:
+                note = "Downloaded but not loaded; LM Studio loads it on first use if Just-In-Time loading is on"
+            if info and info["context"]:
+                self.context_limits[LMSTUDIO_PREFIX + name] = info["context"]
+            entries.append(lmstudio_model_spec(name, note))
+        return entries or [LMSTUDIO_OFFLINE_ENTRY]
+
     def select_model(self, screen: "curses._CursesWindow") -> None:
+        lm_entries = self.fetch_lmstudio_models()
+        entries = (
+            CUSTOM_MODEL_PICKER_ENTRY,
+            *(model for model in MODEL_CATALOG if not model.retired),
+            *lm_entries,
+            *(model for model in MODEL_CATALOG if model.retired),
+        )
         selected_id = (
             self.model.identifier
-            if self.data["model"] in MODEL_BY_ID
+            if self.data["model"] in MODEL_BY_ID or self.data["model"] in {model.identifier for model in lm_entries}
             else CUSTOM_MODEL_PICKER_ENTRY.identifier
         )
         query = ""
@@ -2439,7 +2931,7 @@ class Tui:
             height, width = screen.getmaxyx()
             matches = [
                 model
-                for model in (CUSTOM_MODEL_PICKER_ENTRY, *MODEL_CATALOG)
+                for model in entries
                 if query.lower() in "{} {} {}".format(model.identifier, model.label, model.group).lower()
             ]
             if matches and selected_id not in {model.identifier for model in matches}:
@@ -2479,6 +2971,10 @@ class Tui:
                 if not matches:
                     continue
                 selected_model = matches[selected]
+                if selected_model.identifier == LMSTUDIO_OFFLINE_ENTRY.identifier:
+                    self.status = "LM Studio is not reachable at {}. Start its local server (Developer tab, Start Server) or relaunch with --lmstudio-url.".format(self.lmstudio_url)
+                    self.show_cursor()
+                    return
                 if selected_model.identifier == CUSTOM_MODEL_PICKER_ENTRY.identifier:
                     if self.select_custom_model(screen):
                         self.show_cursor()
@@ -2492,13 +2988,13 @@ class Tui:
                     self.status = "Selected {}. Shared context is retained.".format(selected_model.label)
                 self.show_cursor()
                 return
-            if self.is_cancel_key(key) or key in ("q", "Q"):
+            if self.is_cancel_key(key):
                 self.show_cursor()
                 return
-            if key in (curses.KEY_UP, "k"):
+            if key == curses.KEY_UP:
                 if matches:
                     selected_id = matches[max(0, selected - 1)].identifier
-            elif key in (curses.KEY_DOWN, "j"):
+            elif key == curses.KEY_DOWN:
                 if matches:
                     selected_id = matches[min(len(matches) - 1, selected + 1)].identifier
             elif key == curses.KEY_F5:
@@ -2507,7 +3003,7 @@ class Tui:
                 query = query[:-1]
             elif key == "\x15":
                 query = ""
-            elif isinstance(key, str) and key.isprintable() and key not in ("j", "k") and len(query) < 128:
+            elif isinstance(key, str) and key.isprintable() and len(query) < 128:
                 query += key
 
     def select_custom_model(self, screen: "curses._CursesWindow") -> bool:
@@ -2533,7 +3029,7 @@ class Tui:
             return False
 
     def availability_marker(self, model: ModelSpec) -> str:
-        if self.available_models is None:
+        if self.available_models is None or model.protocol == "lmstudio":
             return model.availability_note
         return "available" if model.identifier in self.available_models else "not listed for this key"
 
@@ -2703,7 +3199,7 @@ class Tui:
                 level = generation.get("thinking_level")
                 value = level or "default"
                 if level and level not in levels:
-                    value += "   (not supported by {}; ignored)".format(self.model.identifier)
+                    value += "   (not supported by {}; ignored)".format(display_model_name(self.model.identifier))
                 rows.append(("thinking_level", "Thinking level", value, "How much the model reasons before answering. This model accepts: {}.".format(", ".join(levels))))
             elif mode == "budget":
                 budget = generation.get("thinking_budget")
@@ -2931,7 +3427,7 @@ class Tui:
         for name, totals in models:
             lines.append(
                 "  {}   {} in / {} out   {}".format(
-                    name, self.format_tokens(totals["input"]), self.format_tokens(totals["output"]), self.format_cost(totals)
+                    display_model_name(name), self.format_tokens(totals["input"]), self.format_tokens(totals["output"]), self.format_cost(totals)
                 )
             )
         if not models:
@@ -3118,6 +3614,10 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--list-models", action="store_true", help="Print the built-in model catalog and exit.")
     parser.add_argument(
+        "--lmstudio-url",
+        help="Address of LM Studio's local server (default http://127.0.0.1:1234, or the LMSTUDIO_BASE_URL environment variable).",
+    )
+    parser.add_argument(
         "--api-base-url",
         help="Send API requests to a local test server such as tools/mock_gemini_server.py (loopback http:// URLs only).",
     )
@@ -3137,6 +3637,14 @@ def main() -> int:
             print("--api-base-url must be a loopback address like http://127.0.0.1:8765", file=sys.stderr)
             return 2
         API_BASE_URL = "http://{}".format(parsed_base.netloc)
+    lmstudio_address = arguments.lmstudio_url or os.environ.get("LMSTUDIO_BASE_URL")
+    if lmstudio_address:
+        global LMSTUDIO_URL
+        try:
+            LMSTUDIO_URL = validate_lmstudio_url(lmstudio_address)
+        except ApiError as error:
+            print(str(error), file=sys.stderr)
+            return 2
     restart_key = os.environ.pop("GEMINI_LEGACY_TUI_RESTART_KEY", "")
     api_key_from_file = ""
     if arguments.api_key_file:

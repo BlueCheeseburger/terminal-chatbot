@@ -88,6 +88,25 @@ chat-bison-001          (PaLM, HTTP 501)
 
 The availability check is advisory: it uses the current `models.list` endpoint. A `404` or `403` means the model is not available to your API key.
 
+## LM Studio (local models)
+
+LM Studio models run on your own machine through its local server, so they need no API key and cost nothing. In LM Studio, load a model and start the server (Developer tab, Start Server). Then open `/model`: every model the server reports appears under **LM Studio (local)**, marked as loaded or downloaded-but-not-loaded (LM Studio loads those on first use when Just-In-Time loading is on, so the first reply can be slow). Embedding models are left out. If the server is not running, that group shows a single "LM Studio is not running" row instead.
+
+- The default address is `http://127.0.0.1:1234`. Use `--lmstudio-url http://host:port` or the `LMSTUDIO_BASE_URL` environment variable for another machine or port. If LM Studio's "Require Authentication" is on, create a token in its Server Settings, set `LMSTUDIO_API_KEY`, and relaunch. The token goes only to the LM Studio address, never your Gemini key.
+- Replies stream, count toward the header's token totals and the Usage stats screen, and show as `model (LM Studio)`. Cost is always `$0`. The header's context window is the loaded context length LM Studio reports (or the model's maximum if it is not loaded).
+- `/thinking` applies temperature, top P, top K, max output tokens (`max_tokens`), seed, penalties, and stop sequences. The thinking level and Terminal access are Gemini-only for now.
+- The conversation is shared across providers, like switching between Gemini models.
+- In the model picker every letter types into the filter (`q`, `j`, and `k` used to be shortcuts), so names like `qwen` work. Use the arrow keys and `Esc`.
+
+How it copes with different models and LM Studio versions (LM Studio's docs do not cover every detail, so these are handled defensively):
+
+- **Chat templates that reject a system message** (some Gemma and Mistral templates): on a role or template error the app retries once with the system instruction merged into the first user message, and remembers that for the model during the session. Back-to-back messages with the same role are also merged, since several templates require strict alternation.
+- **Reasoning models:** `<think>`, `<thinking>`, `<reasoning>`, and `<thought>` blocks, a closing tag with no opener, and gpt-oss "harmony" channels are all hidden from the reply. During streaming a stray closing tag can leave some reasoning text visible until the reply finishes, at which point it is replaced by the cleaned text.
+- **Servers that reject `stream_options` or send no token counts:** the app retries without the option and then estimates tokens at about 4 characters each, so the header's counts and context gauge are approximate for those models.
+- **Model discovery:** names come from `/v1/models`; loaded state, model type, and context length come from LM Studio's native API (`/api/v1/models`, falling back to `/api/v0/models`). If neither exists, embedding models are filtered by name.
+- **Errors:** LM Studio's error body may be plain text, a string, or an object; all are read. A rejected token, a conversation that no longer fits the context, and a model that cannot be found or loaded each get a specific message. A reply cut off at the token limit says so in the status line.
+- Model IDs with slashes, colons, `@`, spaces, or non-ASCII characters are accepted. Embedding-only IDs and IDs containing control characters are not.
+
 ## Terminal access
 
 Settings has a **Terminal access** toggle, off by default. When it is on, `gemini-flash-latest`, Gemini 4 models (`gemini-4-*`), and Gemini 3.8 Flash and later can call a `run_terminal_command` tool. Other models (including custom IDs that do not match) ignore the toggle.
