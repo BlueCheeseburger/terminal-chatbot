@@ -190,12 +190,12 @@ DEFAULT_THEME_ID = "midnight"
 MODEL_CATALOG: Sequence[ModelSpec] = (
     ModelSpec("gemini-4-argon", "Gemini 4 Argon", "Gemini 4", "gemini", "Current stable"),
     ModelSpec("gemini-3.8-flash", "Gemini 3.8 Flash", "Gemini Flash", "gemini", "Current stable"),
-    ModelSpec("gemini-3.7-flash", "Gemini 3.7 Flash", "Gemini Flash", "gemini", "Available through your API key"),
     ModelSpec("gemini-3.6-flash", "Gemini 3.6 Flash", "Gemini Flash", "gemini", "Current stable"),
     ModelSpec("gemini-3-flash-preview", "Gemini 3 Flash", "Gemini Flash", "gemini", "Preview"),
     ModelSpec("gemini-2.5-flash", "Gemini 2.5 Flash", "Gemini Flash", "gemini", "Previously active users only"),
     ModelSpec("gemini-flash-latest", "Gemini Flash (latest alias)", "Gemini Flash", "gemini", "Moving alias"),
     ModelSpec("gemini-mock-model", "Mock model (local test server)", "Testing", "gemini", "Fake replies from tools/mock_gemini_server.py on this machine; no API key or credits", False, True),
+    ModelSpec("gemini-3.7-flash", "Gemini 3.7 Flash", "Unavailable", "gemini", "Not on Google's current model list", True),
     ModelSpec("gemini-3.5-flash", "Gemini 3.5 Flash", "Unavailable", "gemini", "Not on Google's current model list; likely 404", True),
     ModelSpec("gemini-1.5-flash", "Gemini 1.5 Flash", "Unavailable", "gemini", "Legacy; shut down by Google", True),
     ModelSpec("gemini-1.5-flash-001", "Gemini 1.5 Flash 001", "Unavailable", "gemini", "Legacy; likely unavailable", True),

@@ -66,7 +66,6 @@ The prompt box grows with each new line up to 5 lines tall, then scrolls. Plain 
 ```text
 gemini-4-argon
 gemini-3.8-flash
-gemini-3.7-flash
 gemini-3.6-flash
 gemini-3-flash-preview
 gemini-2.5-flash        (previously active users only)
@@ -76,6 +75,7 @@ gemini-flash-latest     (moving alias)
 Greyed out in the picker (likely 404 or 501, but still selectable):
 
 ```text
+gemini-3.7-flash
 gemini-3.5-flash
 gemini-1.5-flash
 gemini-1.5-flash-001
